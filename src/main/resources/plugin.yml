@@ -1,0 +1,13 @@
+name: TheGreatCold
+main: me.megadedbeb.thegreatcold.TheGreatColdPlugin
+version: 1.0
+api-version: 1.21
+commands:
+  greatcold:
+    description: Управление Великим холодом
+    usage: /greatcold [subcommand...]
+    permission: greatcold.admin
+    aliases: [greatcold]
+permissions:
+  greatcold.admin:
+    default: op

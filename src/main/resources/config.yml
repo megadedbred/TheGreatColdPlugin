@@ -1,0 +1,55 @@
+# Настройки этапов (в секундах)
+stage_durations:
+  0: 18000   # 5 часов
+  1: 54000   # 15 часов
+  2: 86400   # 24 часа
+  3: 36000   # 10 часов
+
+# Уровни и эффекты стадий обморожения
+freeze_stages:
+  '1':
+    damage: 1
+    damage_interval: 5
+    slowness: 1
+    hunger: 2
+    required_heat_sec: 60
+  '2':
+    damage: 2
+    damage_interval: 5
+    slowness: 2
+    hunger: 2
+    weakness: 1
+    fatigue: 1
+    required_heat_sec: 180
+  '3':
+    damage: 4
+    damage_interval: 5
+    slowness: 3
+    hunger: 3
+    fatigue: 3
+    weakness: 1
+    blindness: 1
+    required_heat_sec: 300
+  '4':
+    damage: 3
+    damage_interval: 1
+    slowness: 255
+    hunger: 5
+    fatigue: 4
+    weakness: 2
+    blindness: 1
+    required_heat_sec: -1
+
+# Радиусы источников тепла (по типу)
+heat_radius:
+  CAMPFIRE: 3
+  SOUL_CAMPFIRE: 3
+  LAVA: 1
+  MAGMA_BLOCK: 1
+  FIRE: 1
+  FURNACE: 2
+  BLAST_FURNACE: 2
+  SMOKER: 2
+
+# Автоматическая смена этапов вкл/выкл
+auto_stage: false
