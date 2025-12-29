@@ -11,6 +11,8 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.world.ChunkLoadEvent;
 import org.bukkit.event.world.WorldLoadEvent;
+import org.bukkit.event.world.ChunkUnloadEvent;
+import org.bukkit.scheduler.BukkitTask;
 
 import java.util.*;
 
@@ -22,6 +24,7 @@ public class HeatSourceManager implements Listener {
 
     private final TheGreatColdPlugin plugin;
     private final DataManager dataManager;
+    private final CustomHeatManager customHeatManager; // integration for custom sources
 
     // sourceKey -> region (sourceKey = world:x:y:z)
     private final Map<String, HeatSourceRegion> activeRegions = new HashMap<>();
@@ -29,12 +32,21 @@ public class HeatSourceManager implements Listener {
     // chunkKey -> set of sourceKeys in that chunk (chunkKey = world:chunkX:chunkZ)
     private final Map<String, Set<String>> chunkIndex = new HashMap<>();
 
+    // временные задачи инкрементного сканирования чанка (чтобы не нагружать сервер при загрузке мира)
+    // chunkKey -> BukkitTask
+    private final Map<String, BukkitTask> chunkScanTasks = new HashMap<>();
+
     // validation interval (ticks). 600 ticks = 30s. Можно изменить при необходимости.
     private static final long VALIDATION_INTERVAL_TICKS = 600L;
 
-    public HeatSourceManager(TheGreatColdPlugin plugin, DataManager dataManager) {
+    // Сколько колонн (x,z) чанка обрабатывать за тик при полном сканировании.
+    // 16 -> закончить скан одного чанка за ~16 тиков.
+    private static final int COLUMNS_PER_TICK = 16;
+
+    public HeatSourceManager(TheGreatColdPlugin plugin, DataManager dataManager, CustomHeatManager customHeatManager) {
         this.plugin = plugin;
         this.dataManager = dataManager;
+        this.customHeatManager = customHeatManager;
 
         Bukkit.getPluginManager().registerEvents(this, plugin);
 
@@ -51,6 +63,13 @@ public class HeatSourceManager implements Listener {
         activeRegions.clear();
         chunkIndex.clear();
         restoreSavedHeatSources();
+
+        // Запускаем инкрементное сканирование загруженных чанков (чтобы найти природные источники, лаву и т.п.)
+        for (World world : Bukkit.getWorlds()) {
+            for (Chunk chunk : world.getLoadedChunks()) {
+                scanChunkForHeat(chunk);
+            }
+        }
     }
 
     private void restoreSavedHeatSources() {
@@ -84,25 +103,122 @@ public class HeatSourceManager implements Listener {
     }
 
     @EventHandler
+    public void onChunkUnload(ChunkUnloadEvent e) {
+        // Отменяем фоновую задачу сканирования, если она есть
+        String ck = chunkKeyFor(e.getChunk());
+        BukkitTask t = chunkScanTasks.remove(ck);
+        if (t != null) {
+            try { t.cancel(); } catch (Throwable ignored) {}
+        }
+    }
+
+    @EventHandler
     public void onWorldLoad(WorldLoadEvent e) {
         for (Chunk c : e.getWorld().getLoadedChunks()) scanChunkForHeat(c);
     }
 
+    /**
+     * Сканирует один чанк. Для минимизации пикового нагрузки:
+     * - Сначала делаем быструю проверку tile-entities и верхних слоёв (surface/near-surface).
+     * - Затем планируем полноскан чанка, разбитый на небольшие порции (несколько колонн в тик).
+     */
     private void scanChunkForHeat(Chunk chunk) {
+        if (chunk == null || !chunk.isLoaded()) return;
+        String chunkKey = chunkKeyFor(chunk);
+        Set<String> existing = chunkIndex.get(chunkKey);
+        if (existing != null && !existing.isEmpty()) {
+            quickScanChunk(chunk);
+            return;
+        }
+
+        if (chunkScanTasks.containsKey(chunkKey)) return;
+
+        quickScanChunk(chunk);
+
+        BukkitRunnable task = new BukkitRunnable() {
+            private int colIndex = 0; // 0..255 -> each maps to (x,z)
+            private final World world = chunk.getWorld();
+            private final int minY = (world != null) ? world.getMinHeight() : chunk.getWorld().getMinHeight();
+            private final int maxY = (world != null) ? world.getMaxHeight() : chunk.getWorld().getMaxHeight();
+
+            @Override
+            public void run() {
+                try {
+                    if (!chunk.isLoaded()) {
+                        cancel();
+                        chunkScanTasks.remove(chunkKey);
+                        return;
+                    }
+                    int processed = 0;
+                    while (processed < COLUMNS_PER_TICK && colIndex < 256) {
+                        int cx = colIndex % 16;
+                        int cz = colIndex / 16;
+                        colIndex++;
+                        processed++;
+
+                        for (int y = minY; y < maxY; y++) {
+                            try {
+                                Block block = chunk.getBlock(cx, y, cz);
+                                Material mat = block.getType();
+                                if (HEAT_SOURCES.contains(mat)) {
+                                    if (providesHeat(block)) {
+                                        registerHeatSource(block);
+                                    }
+                                }
+                            } catch (Throwable ignored) {}
+                        }
+                    }
+                    if (colIndex >= 256) {
+                        cancel();
+                        chunkScanTasks.remove(chunkKey);
+                    }
+                } catch (Throwable t) {
+                    try { cancel(); } catch (Throwable ignored) {}
+                    chunkScanTasks.remove(chunkKey);
+                }
+            }
+        };
+
+        BukkitTask bt = task.runTaskTimer(plugin, 0L, 1L);
+        chunkScanTasks.put(chunkKey, bt);
+    }
+
+    private void quickScanChunk(Chunk chunk) {
         World world = chunk.getWorld();
-        int minY = world.getMinHeight();
-        int maxY = Math.min(world.getMaxHeight(), world.getSeaLevel() + 256);
-        for (int x = 0; x < 16; x++) {
-            for (int z = 0; z < 16; z++) {
-                for (int y = minY; y < maxY; y++) {
-                    Block block = chunk.getBlock(x, y, z);
-                    Material mat = block.getType();
-                    if (HEAT_SOURCES.contains(mat) && providesHeat(block)) {
-                        registerHeatSource(block);
+        if (world == null) return;
+
+        try {
+            for (BlockState tile : chunk.getTileEntities()) {
+                try {
+                    Block b = tile.getBlock();
+                    if (b == null) continue;
+                    Material m = b.getType();
+                    if (HEAT_SOURCES.contains(m) && providesHeat(b)) {
+                        registerHeatSource(b);
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+
+        try {
+            for (int x = 0; x < 16; x++) {
+                for (int z = 0; z < 16; z++) {
+                    int bx = chunk.getX() * 16 + x;
+                    int bz = chunk.getZ() * 16 + z;
+                    int topY = world.getHighestBlockYAt(bx, bz);
+                    int fromY = Math.max(world.getMinHeight(), topY - 64);
+                    for (int y = topY; y >= fromY; y--) {
+                        try {
+                            Block b = chunk.getBlock(x, y, z);
+                            if (HEAT_SOURCES.contains(b.getType()) && providesHeat(b)) {
+                                registerHeatSource(b);
+                                break;
+                            }
+                        } catch (Throwable ignored) {}
                     }
                 }
             }
-        }
+        } catch (Throwable ignored) {}
     }
 
     private void startValidationTask() {
@@ -165,21 +281,21 @@ public class HeatSourceManager implements Listener {
         if (mat == Material.FURNACE || mat == Material.SMOKER || mat == Material.BLAST_FURNACE) {
             BlockState state = block.getState();
             try {
-                if (state instanceof org.bukkit.block.Furnace f) {
-                    if (f.getBurnTime() > 0) return true;
-                    try {
-                        FurnaceInventory inv = (FurnaceInventory) f.getInventory();
-                        if (inv != null) {
-                            if (inv.getFuel() != null) return true;
-                            if (inv.getSmelting() != null) return true;
-                        }
-                    } catch (Throwable ignored) {}
-                    return false;
-                }
+                try {
+                    var m = state.getClass().getMethod("getBurnTime");
+                    Object res = m.invoke(state);
+                    if (res instanceof Number) {
+                        if (((Number) res).intValue() > 0) return true;
+                    }
+                } catch (NoSuchMethodException ignored) {}
+                try {
+                    int blockLight = block.getLightLevel() - block.getLightFromSky();
+                    if (blockLight > 0) return true;
+                } catch (Throwable ignored) {}
+                return false;
             } catch (Throwable ignored) {
                 return false;
             }
-            return false;
         }
         return mat == Material.LAVA || mat == Material.MAGMA_BLOCK || mat == Material.FIRE;
     }
@@ -229,6 +345,10 @@ public class HeatSourceManager implements Listener {
      */
     public boolean isLocationInHeat(Location loc) {
         if (loc == null || loc.getWorld() == null) return false;
+
+        // First, check custom heat sources (they have larger zones and apply even when their block isn't loaded)
+        if (customHeatManager != null && customHeatManager.isLocationInCustomHeat(loc)) return true;
+
         Chunk chunk = loc.getChunk();
         int chunkRadius = 1; // смотрим соседние чанки
         for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
