@@ -4,6 +4,7 @@ import me.megadedbeb.thegreatcold.TheGreatColdPlugin;
 import me.megadedbeb.thegreatcold.config.ConfigManager;
 import me.megadedbeb.thegreatcold.data.DataManager;
 import me.megadedbeb.thegreatcold.data.PlayerFreezeData;
+import me.megadedbeb.thegreatcold.heat.CustomHeatManager;
 import me.megadedbeb.thegreatcold.heat.HeatSourceManager;
 import me.megadedbeb.thegreatcold.stage.StageManager;
 import me.megadedbeb.thegreatcold.util.Messaging;
@@ -24,6 +25,7 @@ public class FreezeManager {
     private final DataManager dataManager;
     private final HeatSourceManager heatManager;
     private final StageManager stageManager;
+    private final CustomHeatManager customHeatManager;
     private BukkitTask freezeTask;
 
     public FreezeManager(TheGreatColdPlugin plugin, ConfigManager config, DataManager dataManager,
@@ -33,6 +35,7 @@ public class FreezeManager {
         this.dataManager = dataManager;
         this.heatManager = heatManager;
         this.stageManager = stageManager;
+        this.customHeatManager = plugin.getCustomHeatManager();
         // тик каждую секунду
         freezeTask = Bukkit.getScheduler().runTaskTimer(plugin, this::tick, 20L, 20L);
     }
@@ -64,8 +67,16 @@ public class FreezeManager {
 
         // Определяем, считается ли игрок находящимся в зоне тепла.
         boolean rawInHeat = heatManager.isPlayerInHeat(player);
+        // Если игрок в зоне кастомного источника — считаем его нагретым независимо от открытости неба
+        boolean inCustomHeat = (customHeatManager != null) && customHeatManager.isLocationInCustomHeat(player.getLocation());
+
         boolean openToSky = NmsHelper.isOpenToSky(player.getLocation().getBlock());
-        boolean inHeat = rawInHeat && !(globalStageId >= 2 && openToSky);
+        boolean inHeat;
+        if (inCustomHeat) {
+            inHeat = true;
+        } else {
+            inHeat = rawInHeat && !(globalStageId >= 2 && openToSky);
+        }
 
         // сохраняем флаг
         if (!fd.isInHeat() && inHeat) {
@@ -74,12 +85,17 @@ public class FreezeManager {
         }
         fd.setInHeat(inHeat);
 
+        // (остальная логика без изменений...)
         if (!inHeat) {
             // Вне источника тепла
             fd.setTimeInHeat(0L);
             fd.setTimeWithoutHeat(fd.getTimeWithoutHeat() + 1000L);
 
-            FreezeStage desired = computeDesiredStageByTimeout(fd.getTimeWithoutHeat(), globalStageId);
+            FreezeStage desired = computeDesiredStageByTimeout(fd.getTimeWithoutHeat(), globalStageId, fd.isUndergroundMode());
+            if (fd.isUndergroundMode() && fd.getFreezeStage().id() >= FreezeStage.STAGE_2.id()) {
+                desired = fd.getFreezeStage();
+            }
+
             if (desired.id() > fd.getFreezeStage().id()) {
                 fd.setFreezeStage(desired);
                 fd.setDamageAccumulatorMs(0L);
@@ -122,23 +138,46 @@ public class FreezeManager {
         tickEffects(player, fd);
     }
 
-    private FreezeStage computeDesiredStageByTimeout(long timeWithoutHeatMs, int globalStageId) {
+    /**
+     * Новая версия: учитывает подземный режим (underground). В подземном режиме допустимые стадии
+     * ограничены (максимум STAGE_2), а временные пороги отличаются (см. требования).
+     */
+    private FreezeStage computeDesiredStageByTimeout(long timeWithoutHeatMs, int globalStageId, boolean underground) {
         if (globalStageId <= 0) return FreezeStage.NONE;
-        if (globalStageId == 1) {
-            if (timeWithoutHeatMs >= 6 * 60_000L) return FreezeStage.STAGE_2;
-            if (timeWithoutHeatMs >= 3 * 60_000L) return FreezeStage.STAGE_1;
-            return FreezeStage.NONE;
-        } else if (globalStageId == 2) {
-            if (timeWithoutHeatMs >= 7 * 60_000L) return FreezeStage.STAGE_3;
-            if (timeWithoutHeatMs >= 5 * 60_000L) return FreezeStage.STAGE_2;
-            if (timeWithoutHeatMs >= 2 * 60_000L) return FreezeStage.STAGE_1;
-            return FreezeStage.NONE;
-        } else { // globalStageId >= 3
-            if (timeWithoutHeatMs >= 5 * 60_000L) return FreezeStage.STAGE_4;
-            if (timeWithoutHeatMs >= 4 * 60_000L) return FreezeStage.STAGE_3;
-            if (timeWithoutHeatMs >= 2 * 60_000L) return FreezeStage.STAGE_2;
-            if (timeWithoutHeatMs >= 1 * 60_000L) return FreezeStage.STAGE_1;
-            return FreezeStage.NONE;
+
+        if (!underground) {
+            // Существующая (обычная) логика
+            if (globalStageId == 1) {
+                if (timeWithoutHeatMs >= 6 * 60_000L) return FreezeStage.STAGE_2;
+                if (timeWithoutHeatMs >= 3 * 60_000L) return FreezeStage.STAGE_1;
+                return FreezeStage.NONE;
+            } else if (globalStageId == 2) {
+                if (timeWithoutHeatMs >= 7 * 60_000L) return FreezeStage.STAGE_3;
+                if (timeWithoutHeatMs >= 5 * 60_000L) return FreezeStage.STAGE_2;
+                if (timeWithoutHeatMs >= 2 * 60_000L) return FreezeStage.STAGE_1;
+                return FreezeStage.NONE;
+            } else { // globalStageId >= 3
+                if (timeWithoutHeatMs >= 5 * 60_000L) return FreezeStage.STAGE_4;
+                if (timeWithoutHeatMs >= 4 * 60_000L) return FreezeStage.STAGE_3;
+                if (timeWithoutHeatMs >= 2 * 60_000L) return FreezeStage.STAGE_2;
+                if (timeWithoutHeatMs >= 1 * 60_000L) return FreezeStage.STAGE_1;
+                return FreezeStage.NONE;
+            }
+        } else {
+            // Подземные пороги (ограничение: максимум STAGE_2)
+            if (globalStageId == 1) {
+                if (timeWithoutHeatMs >= 40 * 60_000L) return FreezeStage.STAGE_2;
+                if (timeWithoutHeatMs >= 25 * 60_000L) return FreezeStage.STAGE_1;
+                return FreezeStage.NONE;
+            } else if (globalStageId == 2) {
+                if (timeWithoutHeatMs >= 30 * 60_000L) return FreezeStage.STAGE_2;
+                if (timeWithoutHeatMs >= 15 * 60_000L) return FreezeStage.STAGE_1;
+                return FreezeStage.NONE;
+            } else { // globalStageId >= 3
+                if (timeWithoutHeatMs >= 20 * 60_000L) return FreezeStage.STAGE_2;
+                if (timeWithoutHeatMs >= 10 * 60_000L) return FreezeStage.STAGE_1;
+                return FreezeStage.NONE;
+            }
         }
     }
 
