@@ -3,9 +3,11 @@ package me.megadedbeb.thegreatcold.data;
 import me.megadedbeb.thegreatcold.TheGreatColdPlugin;
 import me.megadedbeb.thegreatcold.heat.HeatSourceRegion;
 import me.megadedbeb.thegreatcold.heat.HeatSourceType;
+import me.megadedbeb.thegreatcold.heat.CustomHeatSource;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.configuration.file.YamlConfiguration;
+import org.bukkit.World;
 
 import java.io.File;
 import java.io.IOException;
@@ -24,6 +26,9 @@ public class DataManager {
     // сохранённые источники тепла (ключ world:x:y:z)
     private final Map<String, HeatSourceRegion> savedHeatSources = new HashMap<>();
 
+    // сохранённые кастомные источники: key -> map(type, world, x, y, z, fuelMillis)
+    private final Map<String, Map<String, String>> savedCustomSources = new HashMap<>();
+
     public DataManager(TheGreatColdPlugin plugin) {
         this.plugin = plugin;
         this.dataFile = new File(plugin.getDataFolder(), "data.yml");
@@ -38,6 +43,7 @@ public class DataManager {
     public void loadAll() {
         playerData.clear();
         savedHeatSources.clear();
+        savedCustomSources.clear();
 
         currentStageId = config.getInt("stage.id", 0);
         stageEndMillis = config.getLong("stage.endMillis", 0);
@@ -83,6 +89,28 @@ public class DataManager {
                 } catch (Exception ignored) {}
             }
         }
+
+        if (config.isConfigurationSection("custom_sources")) {
+            for (String key : config.getConfigurationSection("custom_sources").getKeys(false)) {
+                try {
+                    String type = config.getString("custom_sources." + key + ".type");
+                    String world = config.getString("custom_sources." + key + ".world");
+                    int x = config.getInt("custom_sources." + key + ".x");
+                    int y = config.getInt("custom_sources." + key + ".y");
+                    int z = config.getInt("custom_sources." + key + ".z");
+                    long fuel = config.getLong("custom_sources." + key + ".fuelMillis", 0L);
+                    if (type == null || world == null) continue;
+                    Map<String, String> map = new HashMap<>();
+                    map.put("type", type);
+                    map.put("world", world);
+                    map.put("x", String.valueOf(x));
+                    map.put("y", String.valueOf(y));
+                    map.put("z", String.valueOf(z));
+                    map.put("fuelMillis", String.valueOf(fuel));
+                    savedCustomSources.put(key, map);
+                } catch (Exception ignored) {}
+            }
+        }
     }
 
     public void saveAll() {
@@ -118,6 +146,21 @@ public class DataManager {
                 config.set("heat_sources." + key + ".z", c.getBlockZ());
                 config.set("heat_sources." + key + ".type", r.getType().name());
                 config.set("heat_sources." + key + ".radius", r.getRadius());
+            }
+        }
+
+        if (savedCustomSources.isEmpty()) {
+            config.set("custom_sources", null);
+        } else {
+            for (Map.Entry<String, Map<String, String>> en : savedCustomSources.entrySet()) {
+                String key = en.getKey();
+                Map<String, String> m = en.getValue();
+                config.set("custom_sources." + key + ".type", m.get("type"));
+                config.set("custom_sources." + key + ".world", m.get("world"));
+                config.set("custom_sources." + key + ".x", Integer.parseInt(m.get("x")));
+                config.set("custom_sources." + key + ".y", Integer.parseInt(m.get("y")));
+                config.set("custom_sources." + key + ".z", Integer.parseInt(m.get("z")));
+                config.set("custom_sources." + key + ".fuelMillis", Long.parseLong(m.getOrDefault("fuelMillis","0")));
             }
         }
 
@@ -162,6 +205,33 @@ public class DataManager {
 
     public void clearSavedHeatSources() {
         savedHeatSources.clear();
+    }
+
+    // custom sources persistence API
+    public Collection<Map<String, String>> getSavedCustomSources() {
+        return Collections.unmodifiableCollection(savedCustomSources.values());
+    }
+
+    public void addSavedCustomSource(CustomHeatSource s) {
+        Location c = s.getBlockLocation(); // use exact block location
+        String key = makeKey(c);
+        Map<String, String> m = new HashMap<>();
+        m.put("type", s.getType());
+        m.put("world", c.getWorld().getName());
+        m.put("x", String.valueOf(c.getBlockX()));
+        m.put("y", String.valueOf(c.getBlockY()));
+        m.put("z", String.valueOf(c.getBlockZ()));
+        m.put("fuelMillis", String.valueOf(s.getFuelMillis()));
+        savedCustomSources.put(key, m);
+    }
+
+    public void removeSavedCustomSource(Location loc) {
+        String key = makeKey(loc);
+        savedCustomSources.remove(key);
+    }
+
+    public void clearSavedCustomSources() {
+        savedCustomSources.clear();
     }
 
     private String makeKey(Location loc) {

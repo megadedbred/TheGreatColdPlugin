@@ -19,6 +19,11 @@ public class PlayerFreezeData {
     private Float storedWalkSpeed = null;
     private boolean walkSpeedModified = false;
 
+    // Новые поля для механики "ниже Y=20"
+    private long timeBelowY = 0L; // ms — накопленное время под Y=20
+    private long timeAboveY = 0L; // ms — накопленное время над Y=20
+    private boolean undergroundMode = false; // true если игрок перешёл в подземный режим (после 60s)
+
     public PlayerFreezeData(UUID uuid) {
         this.uuid = uuid;
     }
@@ -49,6 +54,15 @@ public class PlayerFreezeData {
     public boolean isWalkSpeedModified() { return walkSpeedModified; }
     public void setWalkSpeedModified(boolean walkSpeedModified) { this.walkSpeedModified = walkSpeedModified; }
 
+    public long getTimeBelowY() { return timeBelowY; }
+    public void setTimeBelowY(long timeBelowY) { this.timeBelowY = timeBelowY; }
+
+    public long getTimeAboveY() { return timeAboveY; }
+    public void setTimeAboveY(long timeAboveY) { this.timeAboveY = timeAboveY; }
+
+    public boolean isUndergroundMode() { return undergroundMode; }
+    public void setUndergroundMode(boolean undergroundMode) { this.undergroundMode = undergroundMode; }
+
     public void reset() {
         freezeStage = FreezeStage.NONE;
         timeInHeat = 0L;
@@ -58,5 +72,10 @@ public class PlayerFreezeData {
         heatResetApplied = false;
         // не меняем storedWalkSpeed тут — вызов clearFreeze на уровне менеджера должен восстановить walkSpeed
         walkSpeedModified = false;
+
+        // сбрасываем новую подземную логику при полном ресете
+        timeBelowY = 0L;
+        timeAboveY = 0L;
+        undergroundMode = false;
     }
 }
