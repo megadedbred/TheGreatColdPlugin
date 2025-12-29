@@ -2,6 +2,7 @@ package me.megadedbeb.thegreatcold.listener;
 
 import me.megadedbeb.thegreatcold.TheGreatColdPlugin;
 import me.megadedbeb.thegreatcold.freeze.FreezeManager;
+import me.megadedbeb.thegreatcold.heat.CustomHeatManager;
 import me.megadedbeb.thegreatcold.heat.HeatSourceManager;
 import me.megadedbeb.thegreatcold.util.NmsHelper;
 import org.bukkit.Location;
@@ -18,10 +19,12 @@ import org.bukkit.event.player.PlayerInteractEvent;
 public class BedTradeListener implements Listener {
     private final HeatSourceManager heatManager;
     private final FreezeManager freezeManager;
+    private final CustomHeatManager customHeatManager;
 
     public BedTradeListener(HeatSourceManager heatManager, FreezeManager freezeManager) {
         this.heatManager = heatManager;
         this.freezeManager = freezeManager;
+        this.customHeatManager = TheGreatColdPlugin.getInstance().getCustomHeatManager();
     }
 
     @EventHandler
@@ -33,10 +36,10 @@ public class BedTradeListener implements Listener {
         // Отмена сна без источника тепла нужна ТОЛЬКО на этапах 2 и 3
         if (globalStageId < 2) return;
 
-        // effective in-heat calculation (учитываем вашу логику: тепло не действует под открытым небом на этапах >=2)
         boolean rawInHeat = heatManager.isPlayerInHeat(player);
+        boolean inCustom = (customHeatManager != null) && customHeatManager.isLocationInCustomHeat(player.getLocation());
         boolean openToSky = NmsHelper.isOpenToSky(player.getLocation().getBlock());
-        boolean effectiveInHeat = rawInHeat && !(globalStageId >= 2 && openToSky);
+        boolean effectiveInHeat = inCustom || (rawInHeat && !(globalStageId >= 2 && openToSky));
 
         if (!effectiveInHeat) {
             event.setCancelled(true);
@@ -59,8 +62,9 @@ public class BedTradeListener implements Listener {
             if (globalStageId < 2) return;
 
             boolean rawInHeat = heatManager.isPlayerInHeat(player);
+            boolean inCustom = (customHeatManager != null) && customHeatManager.isLocationInCustomHeat(player.getLocation());
             boolean openToSky = NmsHelper.isOpenToSky(player.getLocation().getBlock());
-            boolean effectiveInHeat = rawInHeat && !(globalStageId >= 2 && openToSky);
+            boolean effectiveInHeat = inCustom || (rawInHeat && !(globalStageId >= 2 && openToSky));
 
             if (globalStageId >= 2 && !effectiveInHeat) {
                 event.setCancelled(true);

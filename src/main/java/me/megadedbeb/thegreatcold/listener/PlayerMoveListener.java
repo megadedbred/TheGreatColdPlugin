@@ -2,6 +2,7 @@ package me.megadedbeb.thegreatcold.listener;
 
 import me.megadedbeb.thegreatcold.TheGreatColdPlugin;
 import me.megadedbeb.thegreatcold.freeze.FreezeManager;
+import me.megadedbeb.thegreatcold.heat.CustomHeatManager;
 import me.megadedbeb.thegreatcold.heat.HeatSourceManager;
 import me.megadedbeb.thegreatcold.util.NmsHelper;
 import org.bukkit.entity.Player;
@@ -15,10 +16,12 @@ public class PlayerMoveListener implements Listener {
     private final FreezeManager freezeManager;
     private final HeatSourceManager heatManager;
     private final Map<UUID, Boolean> playerHeatStates = new HashMap<>();
+    private final CustomHeatManager customHeatManager;
 
     public PlayerMoveListener(FreezeManager freezeManager, HeatSourceManager heatManager) {
         this.freezeManager = freezeManager;
         this.heatManager = heatManager;
+        this.customHeatManager = TheGreatColdPlugin.getInstance().getCustomHeatManager();
     }
 
     @EventHandler
@@ -27,9 +30,15 @@ public class PlayerMoveListener implements Listener {
         if (!player.getWorld().getName().equals("world")) return;
 
         boolean rawInHeat = heatManager.isPlayerInHeat(player);
+        boolean inCustomHeat = (customHeatManager != null) && customHeatManager.isLocationInCustomHeat(player.getLocation());
         int globalStageId = TheGreatColdPlugin.getInstance().getStageManager().getCurrentStage().id();
         boolean openToSky = NmsHelper.isOpenToSky(player.getLocation().getBlock());
-        boolean effectiveInHeat = rawInHeat && !(globalStageId >= 2 && openToSky);
+        boolean effectiveInHeat;
+        if (inCustomHeat) {
+            effectiveInHeat = true;
+        } else {
+            effectiveInHeat = rawInHeat && !(globalStageId >= 2 && openToSky);
+        }
 
         Boolean previous = playerHeatStates.get(player.getUniqueId());
         if (previous == null || effectiveInHeat != previous) {
