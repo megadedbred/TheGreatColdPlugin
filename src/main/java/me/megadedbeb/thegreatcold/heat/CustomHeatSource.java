@@ -13,6 +13,7 @@ import org.bukkit.ChatColor;
  */
 public class CustomHeatSource {
     public static final String TYPE_SMALL_HEATER = "small_heater";
+    public static final String TYPE_SEA_HEATER = "sea_heater";
 
     private final String type;
 
@@ -22,7 +23,7 @@ public class CustomHeatSource {
     // координата центра/для визуализации (blockLocation + offset 0.5, 1.2, 0.5)
     private final Location center;
 
-    private final int radius; // куб радиус (от центра ±radius по осям), для small_heater = 15 (31^3)
+    private final int radius; // куб радиус (от центра ±radius по осям)
     private final long maxFuelMillis;
 
     private long fuelMillis; // текущее количество топлива в миллисекундах
@@ -74,6 +75,7 @@ public class CustomHeatSource {
 
     /**
      * Уменьшение топлива за период (ms). Возвращает true если состояние (active/inactive) изменилось.
+     * Используется внешне; для sea_heater вызов tick только если над блоком есть вода (см. CustomHeatManager).
      */
     public boolean tick(long ms) {
         boolean before = isActive();
@@ -112,16 +114,28 @@ public class CustomHeatSource {
 
     /**
      * Текст верхней строки (название) — зависит от типа и активности.
+     *
+     * Учтите: для sea_heater фактическая "эффективная" активность (вода над блоком) не проверяется в этом методе,
+     * поэтому CustomHeatManager при установке голограммы использует свою логику для корректного цвета имени.
      */
     public String getDisplayName() {
         String title;
         if (TYPE_SMALL_HEATER.equals(type)) {
             title = "Небольшой обогреватель";
+        } else if (TYPE_SEA_HEATER.equals(type)) {
+            title = "Морской обогреватель";
         } else {
             title = "Источник тепла";
         }
-        // цвет: активный -> оранжевый, неактивный -> голубой
-        String color = isActive() ? ChatColor.GOLD.toString() : ChatColor.AQUA.toString();
+        // fallback color (не используется для sea_heater в тех местах, где нужна проверка воды)
+        String color;
+        if (isActive()) {
+            if (TYPE_SMALL_HEATER.equals(type)) color = ChatColor.GOLD.toString();
+            else if (TYPE_SEA_HEATER.equals(type)) color = ChatColor.BLUE.toString();
+            else color = ChatColor.GOLD.toString();
+        } else {
+            color = ChatColor.AQUA.toString();
+        }
         return color + title;
     }
 

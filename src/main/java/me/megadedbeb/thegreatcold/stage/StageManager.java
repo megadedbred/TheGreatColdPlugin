@@ -24,8 +24,10 @@ import java.util.concurrent.ThreadLocalRandom;
  * Управляет текущим этапом холода и побочными задачами (фиксация погоды/времени,
  * тушение костров на небу, плавная трансформация лавы и т.д.).
  *
- * Механика выпадения листвы удалена (по запросу) — теперь планируется только превращение лавы,
- * если она под открытым небом во время этапа 3.
+ * Модификации:
+ * - Лавовые таймеры теперь планируются ТОЛЬКО для чанков рядом с игроками (радиус 1 чанка).
+ * - Таймеры/информация о лаве не сохраняются на диск (вся логика — в памяти).
+ * - По выходу из этапа 3 все задачи отменяются и память очищается.
  */
 public class StageManager {
     private final TheGreatColdPlugin plugin;
@@ -44,6 +46,12 @@ public class StageManager {
     // задачи для плавной трансформации лавы — чтобы отменять при выходе из этапа
     private final List<BukkitTask> scheduledDecayTasks = Collections.synchronizedList(new ArrayList<>());
 
+    // Запланированные чанки для лавы (в памяти): ключ = world:chunkX:chunkZ
+    private final Set<String> scheduledLavaChunks = Collections.synchronizedSet(new HashSet<>());
+
+    // Задача, которая следит за игроками и планирует превращение лавы в чанках рядом с ними
+    private BukkitTask lavaSchedulerTask = null;
+
     public StageManager(TheGreatColdPlugin plugin, ConfigManager config, DataManager data, HeatSourceManager heat) {
         this.plugin = plugin;
         this.config = config;
@@ -54,13 +62,18 @@ public class StageManager {
         heat.scanWorldForHeatSources();
         startCampfireTask(); // always running
 
-        // Регистрируем слушатель загрузки чанков — чтобы при загрузке чанка в этапе 3 планировать трансформацию лавы
+        // Регистрируем слушатель загрузки чанков — теперь планирование выполняется только если рядом игроки
         Bukkit.getPluginManager().registerEvents(new Listener() {
             @EventHandler
             public void onChunkLoad(ChunkLoadEvent e) {
                 try {
                     if (currentStage != null && currentStage.id() == 3) {
-                        scheduleLavaDecayForChunk(e.getChunk());
+                        // plan only if chunk is near any player (radius 1 chunk)
+                        if (isChunkNearAnyPlayer(e.getChunk(), 1)) {
+                            scheduleLavaDecayForChunk(e.getChunk());
+                            String ck = chunkKeyFor(e.getChunk());
+                            scheduledLavaChunks.add(ck);
+                        }
                     }
                 } catch (Throwable ignored) {}
             }
@@ -70,8 +83,8 @@ public class StageManager {
         if (currentStage != null) {
             startEnforceTaskForStage(currentStage.id());
             if (currentStage.id() == 3) {
-                // Если на этапе 3 — восстановим планирование превращения лавы для уже загруженных чанков
-                scheduleLavaDecayForLoadedChunks();
+                // Запускаем планирование лавы рядом с игроками (но НЕ для всех чанков)
+                startLavaScheduler();
             }
         }
     }
@@ -138,8 +151,8 @@ public class StageManager {
 
             // Запуск специфичных эффектов для этапа (ранее здесь был decay для листвы; удалено)
             if (stageId == 3) {
-                // Только планирование превращения лавы для загруженных чанков
-                scheduleLavaDecayForLoadedChunks();
+                // Теперь планирование лавы поручено lavaScheduler — запускаем его
+                startLavaScheduler();
             }
 
             // Запускаем/обновляем задачу поддержания погоды/времени для нового этапа
@@ -168,6 +181,9 @@ public class StageManager {
                 }
                 scheduledDecayTasks.clear();
             }
+            // очистить набор запланированных чанков и остановить планировщик
+            scheduledLavaChunks.clear();
+            stopLavaScheduler();
         }
         // при выходе из этапа отменяем enforce-задачу и восстанавливаем daylight cycle
         stopEnforceTask();
@@ -219,16 +235,56 @@ public class StageManager {
     }
 
     /**
-     * Планирует преобразование лавы -> обсидиан для ВСЕХ загруженных чанков в мире.
+     * Планирует преобразование лавы -> обсидиан только для чанков рядом с игроками.
+     * Метод scheduleLavaDecayForChunk оставлен (он возвращает число запланированных задач),
+     * но вызовы теперь ограничены чанками вокруг игроков.
      */
-    private void scheduleLavaDecayForLoadedChunks() {
-        int totalScheduled = 0;
-        for (World world : Bukkit.getWorlds()) {
-            for (Chunk chunk : world.getLoadedChunks()) {
-                totalScheduled += scheduleLavaDecayForChunk(chunk);
+    private void startLavaScheduler() {
+        if (lavaSchedulerTask != null) return;
+        lavaSchedulerTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            try {
+                if (currentStage == null || currentStage.id() != 3) return;
+                scheduleDecayForChunksNearPlayers(1); // radius 1 chunk
+            } catch (Throwable t) {
+                plugin.getLogger().warning("Ошибка в lavaSchedulerTask: " + t);
+            }
+        }, 60L, 20L * 20L); // первая проверка через ~3 сек, далее каждые 20 секунд
+    }
+
+    private void stopLavaScheduler() {
+        if (lavaSchedulerTask != null) {
+            try { lavaSchedulerTask.cancel(); } catch (Throwable ignored) {}
+            lavaSchedulerTask = null;
+        }
+    }
+
+    /**
+     * Для каждого онлайн-игрока берем чанк и планируем задачи превращения лавы в радиусе chunkRadius.
+     * Не планируем задачи повторно для чанков, уже отмеченных в scheduledLavaChunks.
+     */
+    private void scheduleDecayForChunksNearPlayers(int chunkRadius) {
+        for (org.bukkit.entity.Player p : Bukkit.getOnlinePlayers()) {
+            Chunk pc = p.getLocation().getChunk();
+            for (int dx = -chunkRadius; dx <= chunkRadius; dx++) {
+                for (int dz = -chunkRadius; dz <= chunkRadius; dz++) {
+                    int cx = pc.getX() + dx;
+                    int cz = pc.getZ() + dz;
+                    String ck = pc.getWorld().getName() + ":" + cx + ":" + cz;
+                    if (scheduledLavaChunks.contains(ck)) continue;
+                    Chunk chunk = pc.getWorld().getChunkAt(cx, cz);
+                    // only schedule for loaded chunks
+                    if (!chunk.isLoaded()) continue;
+                    int scheduled = scheduleLavaDecayForChunk(chunk);
+                    if (scheduled > 0) {
+                        scheduledLavaChunks.add(ck);
+                        plugin.getLogger().info("[TheGreatCold] Scheduled lava-transform tasks in chunk " + ck + " -> " + scheduled + " tasks.");
+                    } else {
+                        // if nothing scheduled, mark chunk as processed to avoid repeated wasteful scans for now
+                        scheduledLavaChunks.add(ck);
+                    }
+                }
             }
         }
-        plugin.getLogger().info("[TheGreatCold] Scheduled lava-transform tasks for loaded chunks: " + totalScheduled + " tasks.");
     }
 
     /**
@@ -263,14 +319,11 @@ public class StageManager {
                             }, delayTicks);
                             scheduledDecayTasks.add(t);
                             scheduled++;
+                            if (scheduled >= 1024) break; // safety guard
                         }
                     } catch (Throwable ignored) {}
                 }
             }
-        }
-        if (scheduled > 0) {
-            plugin.getLogger().info("[TheGreatCold] chunk " + chunk.getWorld().getName() + ":" + chunk.getX() + ":" + chunk.getZ()
-                    + " -> scheduled " + scheduled + " lava-transform tasks.");
         }
         return scheduled;
     }
@@ -320,7 +373,7 @@ public class StageManager {
     }
 
     /**
-     * Запускает задачу, которая каждые N секунд принудительно поддерживает погоду/время
+     * Запускает задачу, которая каждые N секунд принудительно поддерживает погоду/времени
      * в зависимости от этапа (0..3). Это нужно, чтобы при рестарте/сне/внешних командах
      * погода не менялась от ожидаемого поведения этапа.
      */
@@ -401,5 +454,24 @@ public class StageManager {
         stopEnforceTask();
         manageStageEndEffects(currentStage.id());
         if (campfireTask != null) { campfireTask.cancel(); campfireTask = null; }
+    }
+
+    private boolean isChunkNearAnyPlayer(Chunk chunk, int radius) {
+        if (chunk == null || chunk.getWorld() == null) return false;
+        String worldName = chunk.getWorld().getName();
+        int cx = chunk.getX();
+        int cz = chunk.getZ();
+        for (org.bukkit.entity.Player p : Bukkit.getOnlinePlayers()) {
+            if (!p.getWorld().getName().equals(worldName)) continue;
+            Chunk pc = p.getLocation().getChunk();
+            int dx = Math.abs(pc.getX() - cx);
+            int dz = Math.abs(pc.getZ() - cz);
+            if (dx <= radius && dz <= radius) return true;
+        }
+        return false;
+    }
+
+    private String chunkKeyFor(Chunk c) {
+        return c.getWorld().getName() + ":" + c.getX() + ":" + c.getZ();
     }
 }
