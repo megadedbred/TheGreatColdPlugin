@@ -5,27 +5,33 @@ import me.megadedbeb.thegreatcold.data.DataManager;
 import me.megadedbeb.thegreatcold.freeze.FreezeManager;
 import me.megadedbeb.thegreatcold.freeze.FreezeStage;
 import me.megadedbeb.thegreatcold.stage.StageManager;
+import me.megadedbeb.thegreatcold.heat.CustomHeatManager;
+import me.megadedbeb.thegreatcold.heat.CustomHeatSource;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
+
+import java.util.Collection;
 
 public class GreatColdCommandExecutor implements CommandExecutor {
     private final StageManager stageManager;
     private final FreezeManager freezeManager;
     private final ConfigManager configManager;
     private final DataManager dataManager;
+    private final CustomHeatManager customHeatManager;
 
-    public GreatColdCommandExecutor(StageManager s, FreezeManager f, ConfigManager c, DataManager d) {
-        this.stageManager = s; this.freezeManager = f; this.configManager = c; this.dataManager = d;
+    public GreatColdCommandExecutor(StageManager s, FreezeManager f, ConfigManager c, DataManager d, CustomHeatManager ch) {
+        this.stageManager = s; this.freezeManager = f; this.configManager = c; this.dataManager = d; this.customHeatManager = ch;
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String lab, String[] args) {
         if (!sender.hasPermission("greatcold.admin")) return true;
         if (args.length == 0) {
-            sender.sendMessage("§7Доступные подкоманды: stage, autostage, stageinfo, setperiod, freeze, unfreeze");
+            sender.sendMessage("§7Доступные подкоманды: stage, autostage, stageinfo, setperiod, freeze, unfreeze, listheaters");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -108,6 +114,25 @@ public class GreatColdCommandExecutor implements CommandExecutor {
                     freezeManager.clearFreeze(p);
                     sender.sendMessage("§aОбморожение снято с "+p.getName());
                 } else sender.sendMessage("§cИгрок не найден.");
+            }
+            case "listheaters" -> {
+                Collection<CustomHeatSource> list = customHeatManager.getAllSources();
+                if (list.isEmpty()) {
+                    sender.sendMessage("§eСохранённых источников тепла не найдено.");
+                } else {
+                    sender.sendMessage("§bСохранённые источники тепла (" + list.size() + "):");
+                    int idx = 1;
+                    for (CustomHeatSource s : list) {
+                        Location loc = s.getBlockLocation();
+                        String world = (loc.getWorld() != null) ? loc.getWorld().getName() : "unknown";
+                        long fuelMin = s.getFuelMillis() / 60000L;
+                        sender.sendMessage("§7" + idx + ") §f" + s.getType()
+                                + " §7at §f" + world + ":" + loc.getBlockX() + ":" + loc.getBlockY() + ":" + loc.getBlockZ()
+                                + " §7active=" + (s.isActive() ? "yes" : "no")
+                                + " §7fuel=" + s.getFuelPercent() + "% (" + fuelMin + " min)");
+                        idx++;
+                    }
+                }
             }
             default -> sender.sendMessage("§cНеизвестная подкоманда.");
         }

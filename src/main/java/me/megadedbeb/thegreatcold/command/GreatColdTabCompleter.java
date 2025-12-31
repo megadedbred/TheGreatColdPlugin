@@ -12,7 +12,7 @@ public class GreatColdTabCompleter implements TabCompleter {
     @Override
     public List<String> onTabComplete(CommandSender s, Command cmd, String a, String[] args) {
         if (args.length == 1)
-            return Arrays.asList("stage", "autostage", "stageinfo", "setperiod", "freeze", "unfreeze", "reload");
+            return Arrays.asList("stage", "autostage", "stageinfo", "setperiod", "freeze", "unfreeze", "listheaters", "reload");
         if (args.length == 2 && args[0].equalsIgnoreCase("autostage"))
             return Arrays.asList("on", "off");
         return Collections.emptyList();
