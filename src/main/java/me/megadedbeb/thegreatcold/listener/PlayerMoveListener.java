@@ -42,10 +42,13 @@ public class PlayerMoveListener implements Listener {
 
         Boolean previous = playerHeatStates.get(player.getUniqueId());
         if (previous == null || effectiveInHeat != previous) {
-            if (effectiveInHeat) {
-                player.sendMessage("§eВы вошли в зону тепла!");
-            } else {
-                player.sendMessage("§bВы покинули зону тепла!");
+            // Do not send enter/leave messages on stage 0
+            if (globalStageId != 0) {
+                if (effectiveInHeat) {
+                    player.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat.enter"));
+                } else {
+                    player.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat.leave"));
+                }
             }
             playerHeatStates.put(player.getUniqueId(), effectiveInHeat);
         }

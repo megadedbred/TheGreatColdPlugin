@@ -21,13 +21,7 @@ import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 /**
- * Управляет текущим этапом холода и побочными задачами (фиксация погоды/времени,
- * тушение костров на небу, плавная трансформация лавы и т.д.).
- *
- * Модификации:
- * - Лавовые таймеры теперь планируются ТОЛЬКО для чанков рядом с игроками (радиус 1 чанка).
- * - Таймеры/информация о лаве не сохраняются на диск (вся логика — в памяти).
- * - По выходу из этапа 3 все задачи отменяются и память очищается.
+ * StageManager — как раньше, с исправленным и оптимизированным startCampfireTask.
  */
 public class StageManager {
     private final TheGreatColdPlugin plugin;
@@ -37,20 +31,18 @@ public class StageManager {
 
     private ColdStage currentStage = ColdStage.COLD_0;
     private BukkitTask autoStageTask;
-    private BukkitTask enforceStageTask; // задача для принудительного поддержания погоды/времени
+    private BukkitTask enforceStageTask;
     private BukkitTask campfireTask;
     private boolean isAutoStage = false;
     private long stageEndMillis = 0;
     private boolean stageInfinite = false;
 
-    // задачи для плавной трансформации лавы — чтобы отменять при выходе из этапа
     private final List<BukkitTask> scheduledDecayTasks = Collections.synchronizedList(new ArrayList<>());
-
-    // Запланированные чанки для лавы (в памяти): ключ = world:chunkX:chunkZ
     private final Set<String> scheduledLavaChunks = Collections.synchronizedSet(new HashSet<>());
-
-    // Задача, которая следит за игроками и планирует превращение лавы в чанках рядом с ними
     private BukkitTask lavaSchedulerTask = null;
+
+    // pending: key = world:x:y:z -> scheduledTimeMillis
+    private final Map<String, Long> pendingExtinguish = Collections.synchronizedMap(new HashMap<>());
 
     public StageManager(TheGreatColdPlugin plugin, ConfigManager config, DataManager data, HeatSourceManager heat) {
         this.plugin = plugin;
@@ -60,32 +52,33 @@ public class StageManager {
 
         loadStageState();
         heat.scanWorldForHeatSources();
-        startCampfireTask(); // always running
+        startCampfireTask();
 
-        // Регистрируем слушатель загрузки чанков — теперь планирование выполняется только если рядом игроки
         Bukkit.getPluginManager().registerEvents(new Listener() {
             @EventHandler
             public void onChunkLoad(ChunkLoadEvent e) {
                 try {
                     if (currentStage != null && currentStage.id() == 3) {
-                        // plan only if chunk is near any player (radius 1 chunk)
                         if (isChunkNearAnyPlayer(e.getChunk(), 1)) {
-                            scheduleLavaDecayForChunk(e.getChunk());
-                            String ck = chunkKeyFor(e.getChunk());
-                            scheduledLavaChunks.add(ck);
+                            int scheduled = scheduleLavaDecayForChunk(e.getChunk());
+                            if (scheduled > 0) {
+                                String ck = chunkKeyFor(e.getChunk());
+                                scheduledLavaChunks.add(ck);
+                                plugin.getLogger().info("[TheGreatCold] Scheduled lava-transform tasks in chunk " + ck + " -> " + scheduled + " tasks.");
+                            } else {
+                                String ck = chunkKeyFor(e.getChunk());
+                                scheduledLavaChunks.add(ck);
+                            }
                         }
                     }
                 } catch (Throwable ignored) {}
             }
         }, plugin);
 
-        // Восстанавливаем enforce-задачи и поведение этапа после перезапуска
         if (currentStage != null) {
+            applyStageWeather(currentStage.id());
             startEnforceTaskForStage(currentStage.id());
-            if (currentStage.id() == 3) {
-                // Запускаем планирование лавы рядом с игроками (но НЕ для всех чанков)
-                startLavaScheduler();
-            }
+            if (currentStage.id() == 3) startLavaScheduler();
         }
     }
 
@@ -94,161 +87,218 @@ public class StageManager {
             ColdStage newStage = ColdStage.fromId(stageId);
             if (newStage == null) return;
 
-            // отменяем эффекты старого этапа
             if (currentStage != null) manageStageEndEffects(currentStage.id());
 
             currentStage = newStage;
-
-            World w = Bukkit.getWorld("world");
-            if (w != null) {
-                switch (stageId) {
-                    case 0 -> {
-                        w.setStorm(false);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-                    }
-                    case 1 -> {
-                        w.setStorm(true);
-                        w.setThundering(false);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-                    }
-                    case 2 -> {
-                        w.setStorm(true);
-                        w.setThundering(true);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-                    }
-                    case 3 -> {
-                        w.setStorm(true);
-                        w.setThundering(true);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        w.setTime(18000); // полночь
-                        try { w.setGameRuleValue("doDaylightCycle", "false"); } catch (Throwable ignored) {}
-                    }
-                }
-
-                // установить max_snow_accumulation_height в соответствии с этапом (не критично)
-                int snowHeight = switch (stageId) {
-                    case 0 -> 2;
-                    case 1 -> 3;
-                    case 2 -> 4;
-                    case 3 -> 8;
-                    default -> 2;
-                };
-                try {
-                    w.setGameRuleValue("max_snow_accumulation_height", String.valueOf(snowHeight));
-                } catch (Exception ignored) {}
-            }
+            applyStageWeather(stageId);
 
             long duration = config.getStageDurationInMillis(stageId);
-            if (stageInfinite) {
-                this.stageEndMillis = Long.MAX_VALUE;
-            } else {
-                this.stageEndMillis = System.currentTimeMillis() + duration;
-            }
+            if (stageInfinite) this.stageEndMillis = Long.MAX_VALUE;
+            else this.stageEndMillis = System.currentTimeMillis() + duration;
             saveStageState();
 
-            // Запуск специфичных эффектов для этапа (ранее здесь был decay для листвы; удалено)
-            if (stageId == 3) {
-                // Теперь планирование лавы поручено lavaScheduler — запускаем его
-                startLavaScheduler();
-            }
-
-            // Запускаем/обновляем задачу поддержания погоды/времени для нового этапа
+            if (stageId == 3) startLavaScheduler();
             startEnforceTaskForStage(stageId);
 
             if (broadcast) {
-                Bukkit.broadcastMessage("§b[Великий холод] Этап " + stageId + " начался!");
+                Bukkit.getOnlinePlayers().stream()
+                        .filter(p -> p.hasPermission("greatcold.admin"))
+                        .forEach(p -> p.sendMessage("§b[Великий холод] Этап " + stageId + " начался!"));
             }
 
-            heat.scanWorldForHeatSources(); // рескан источников тепла
+            heat.scanWorldForHeatSources();
         } catch (Throwable t) {
             plugin.getLogger().severe("Ошибка при смене этапа холода: " + t);
             t.printStackTrace();
         }
     }
 
-    /**
-     * Отменить эффекты старого этапа (например отменить запланированные задачи).
-     */
+    private void applyStageWeather(int stageId) {
+        World w = Bukkit.getWorld("world");
+        if (w == null) return;
+        try {
+            switch (stageId) {
+                case 0 -> {
+                    if (w.hasStorm()) w.setStorm(false);
+                    if (w.isThundering()) w.setThundering(false);
+                    w.setWeatherDuration(Integer.MAX_VALUE);
+                    try { w.setGameRuleValue("doWeatherCycle", "true"); } catch (Throwable ignored) {}
+                    try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
+                }
+                case 1 -> {
+                    if (!w.hasStorm()) w.setStorm(true);
+                    if (w.isThundering()) w.setThundering(false);
+                    w.setWeatherDuration(Integer.MAX_VALUE);
+                    try { w.setGameRuleValue("doWeatherCycle", "false"); } catch (Throwable ignored) {}
+                    try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
+                }
+                case 2 -> {
+                    if (!w.hasStorm()) w.setStorm(true);
+                    if (!w.isThundering()) w.setThundering(true);
+                    w.setWeatherDuration(Integer.MAX_VALUE);
+                    try { w.setGameRuleValue("doWeatherCycle", "false"); } catch (Throwable ignored) {}
+                    try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
+                }
+                case 3 -> {
+                    if (!w.hasStorm()) w.setStorm(true);
+                    if (!w.isThundering()) w.setThundering(true);
+                    w.setTime(18000);
+                    w.setWeatherDuration(Integer.MAX_VALUE);
+                    try { w.setGameRuleValue("doWeatherCycle", "false"); } catch (Throwable ignored) {}
+                    try { w.setGameRuleValue("doDaylightCycle", "false"); } catch (Throwable ignored) {}
+                }
+                default -> {
+                    if (w.hasStorm()) w.setStorm(false);
+                    if (w.isThundering()) w.setThundering(false);
+                    try { w.setGameRuleValue("doWeatherCycle", "true"); } catch (Throwable ignored) {}
+                    try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
+                }
+            }
+        } catch (Throwable t) {
+            plugin.getLogger().warning("applyStageWeather error: " + t);
+        }
+    }
+
+    private void startEnforceTaskForStage(int stageId) {
+        stopEnforceTask();
+        applyStageWeather(stageId);
+        enforceStageTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            try { applyStageWeather(stageId); } catch (Throwable t) { plugin.getLogger().warning("Ошибка в enforceStageTask: " + t); }
+        }, 1L, 20L * 5L);
+    }
+
+    private void stopEnforceTask() {
+        if (enforceStageTask != null) {
+            try { enforceStageTask.cancel(); } catch (Throwable ignored) {}
+            enforceStageTask = null;
+        }
+    }
+
     private void manageStageEndEffects(int oldStageId) {
         if (oldStageId == 3) {
-            // Отменяем все запланированные задачи для трансформации лавы
             synchronized (scheduledDecayTasks) {
                 for (BukkitTask t : scheduledDecayTasks) {
                     try { t.cancel(); } catch (Exception ignored) {}
                 }
                 scheduledDecayTasks.clear();
             }
-            // очистить набор запланированных чанков и остановить планировщик
             scheduledLavaChunks.clear();
             stopLavaScheduler();
         }
-        // при выходе из этапа отменяем enforce-задачу и восстанавливаем daylight cycle
         stopEnforceTask();
-        try { World w = Bukkit.getWorld("world"); if (w != null) w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-    }
-
-    // -- Костры под открытым небом тухнут через 15 сек ТОЛЬКО на этапах 2 и 3
-    private void startCampfireTask() {
-        if (campfireTask != null) return;
-        campfireTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+        try {
             World w = Bukkit.getWorld("world");
-            if (w == null) return;
-            int current = (currentStage == null) ? 0 : currentStage.id();
-            // если текущий этап не 2 и не 3 — не гасим костры
-            if (!(current == 2 || current == 3)) return;
-
-            for (Chunk chunk : w.getLoadedChunks()) {
-                for (int y = w.getMinHeight(); y < w.getMaxHeight(); y++) {
-                    for (int x = 0; x < 16; x++) {
-                        for (int z = 0; z < 16; z++) {
-                            Block block = chunk.getBlock(x, y, z);
-                            if ((block.getType() == Material.CAMPFIRE || block.getType() == Material.SOUL_CAMPFIRE)
-                                    && NmsHelper.isOpenToSky(block)) {
-                                var campfire = block.getBlockData();
-                                if (campfire instanceof Campfire cf && cf.isLit()) {
-                                    // планируем тушение через 15 секунд — ещё раз проверим стадию и состояние
-                                    plugin.getServer().getScheduler().runTaskLater(plugin, () -> {
-                                        try {
-                                            int nowStage = (currentStage == null) ? 0 : currentStage.id();
-                                            if (!(nowStage == 2 || nowStage == 3)) return;
-                                            if (!block.getChunk().isLoaded()) return;
-                                            var maybe = block.getBlockData();
-                                            if (maybe instanceof Campfire cf2 && cf2.isLit() && NmsHelper.isOpenToSky(block)) {
-                                                cf2.setLit(false);
-                                                block.setBlockData(cf2, false);
-                                                block.getWorld().playSound(block.getLocation(),
-                                                        Sound.BLOCK_FIRE_EXTINGUISH, 1.0f, 1.0f);
-                                                heat.removeHeatSource(block);
-                                            }
-                                        } catch (Throwable ignored) {}
-                                    }, 15 * 20L); // 15 секунд
-                                }
-                            }
-                        }
-                    }
-                }
+            if (w != null) {
+                try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
+                try { w.setGameRuleValue("doWeatherCycle", "true"); } catch (Throwable ignored) {}
             }
-        }, 40L, 600L);
+        } catch (Throwable ignored) {}
     }
 
     /**
-     * Планирует преобразование лавы -> обсидиан только для чанков рядом с игроками.
-     * Метод scheduleLavaDecayForChunk оставлен (он возвращает число запланированных задач),
-     * но вызовы теперь ограничены чанками вокруг игроков.
+     * Исправленный/надёжный оптимизированный startCampfireTask.
+     * Проверяем небольшой вертикальный диапазон {topY, topY-1, topY-2} для надёжного обнаружения костров.
      */
+    private void startCampfireTask() {
+        if (campfireTask != null) return;
+
+        campfireTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
+            try {
+                World w = Bukkit.getWorld("world");
+                if (w == null) return;
+                int current = (currentStage == null) ? 0 : currentStage.id();
+                if (!(current == 2 || current == 3)) {
+                    pendingExtinguish.clear();
+                    return;
+                }
+
+                long now = System.currentTimeMillis();
+
+                for (Chunk chunk : w.getLoadedChunks()) {
+                    int baseX = chunk.getX() << 4;
+                    int baseZ = chunk.getZ() << 4;
+
+                    for (int lx = 0; lx < 16; lx++) {
+                        for (int lz = 0; lz < 16; lz++) {
+                            int worldX = baseX + lx;
+                            int worldZ = baseZ + lz;
+                            int topY = w.getHighestBlockYAt(worldX, worldZ);
+                            // Проверяем небольшой набор слоёв: topY, topY-1, topY-2
+                            boolean foundCampfireInColumn = false;
+                            for (int dy = 0; dy >= -2; dy--) {
+                                int checkY = topY + dy;
+                                if (checkY < w.getMinHeight() || checkY > w.getMaxHeight()) continue;
+                                Block b = w.getBlockAt(worldX, checkY, worldZ);
+                                if (b == null) continue;
+                                Material mt = b.getType();
+                                String key = b.getWorld().getName() + ":" + b.getX() + ":" + b.getY() + ":" + b.getZ();
+
+                                if (mt != Material.CAMPFIRE && mt != Material.SOUL_CAMPFIRE) {
+                                    // если запись для этой позиции есть — убираем (значит костра здесь сейчас нет)
+                                    pendingExtinguish.remove(key);
+                                    continue;
+                                }
+
+                                // у нас найден candidate campfire на позиции b
+                                foundCampfireInColumn = true;
+
+                                boolean isLit = false;
+                                try {
+                                    if (b.getBlockData() instanceof Campfire cf && cf.isLit()) isLit = true;
+                                } catch (Throwable ignored) {}
+
+                                if (!isLit) {
+                                    pendingExtinguish.remove(key);
+                                    continue;
+                                }
+
+                                if (!NmsHelper.isOpenToSky(b)) {
+                                    pendingExtinguish.remove(key);
+                                    continue;
+                                }
+
+                                Long scheduledAt = pendingExtinguish.get(key);
+                                if (scheduledAt == null) {
+                                    pendingExtinguish.put(key, now + 15_000L);
+                                } else if (now >= scheduledAt) {
+                                    if (currentStage != null && (currentStage.id() == 2 || currentStage.id() == 3)) {
+                                        if (b.getChunk().isLoaded()) {
+                                            var bd = b.getBlockData();
+                                            if (bd instanceof Campfire cf2 && cf2.isLit() && NmsHelper.isOpenToSky(b)) {
+                                                try {
+                                                    cf2.setLit(false);
+                                                    b.setBlockData(cf2, false);
+                                                    b.getWorld().playSound(b.getLocation(), Sound.BLOCK_FIRE_EXTINGUISH, 1.0f, 1.0f);
+                                                    heat.removeHeatSource(b);
+                                                } catch (Throwable ignored) {}
+                                            }
+                                        }
+                                    }
+                                    pendingExtinguish.remove(key);
+                                }
+                            } // end dy loop
+
+                            // Если в столбце не найден костёр (в проверенных слоях), — можно (по желанию) ничего не делать.
+                            // Мы не пытаемся чистить pendingExtinguish по "другим" ключам тут, т.к. ключи основаны на конкретных позициях.
+                        }
+                    }
+                }
+            } catch (Throwable t) {
+                plugin.getLogger().warning("Ошибка в optimized campfireTask: " + t);
+            }
+        }, 40L, 20L * 10L);
+    }
+
     private void startLavaScheduler() {
         if (lavaSchedulerTask != null) return;
         lavaSchedulerTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
             try {
                 if (currentStage == null || currentStage.id() != 3) return;
-                scheduleDecayForChunksNearPlayers(1); // radius 1 chunk
+                scheduleDecayForChunksNearPlayers(1);
             } catch (Throwable t) {
                 plugin.getLogger().warning("Ошибка в lavaSchedulerTask: " + t);
             }
-        }, 60L, 20L * 20L); // первая проверка через ~3 сек, далее каждые 20 секунд
+        }, 60L, 20L * 20L);
     }
 
     private void stopLavaScheduler() {
@@ -258,10 +308,6 @@ public class StageManager {
         }
     }
 
-    /**
-     * Для каждого онлайн-игрока берем чанк и планируем задачи превращения лавы в радиусе chunkRadius.
-     * Не планируем задачи повторно для чанков, уже отмеченных в scheduledLavaChunks.
-     */
     private void scheduleDecayForChunksNearPlayers(int chunkRadius) {
         for (org.bukkit.entity.Player p : Bukkit.getOnlinePlayers()) {
             Chunk pc = p.getLocation().getChunk();
@@ -272,14 +318,12 @@ public class StageManager {
                     String ck = pc.getWorld().getName() + ":" + cx + ":" + cz;
                     if (scheduledLavaChunks.contains(ck)) continue;
                     Chunk chunk = pc.getWorld().getChunkAt(cx, cz);
-                    // only schedule for loaded chunks
                     if (!chunk.isLoaded()) continue;
                     int scheduled = scheduleLavaDecayForChunk(chunk);
                     if (scheduled > 0) {
                         scheduledLavaChunks.add(ck);
                         plugin.getLogger().info("[TheGreatCold] Scheduled lava-transform tasks in chunk " + ck + " -> " + scheduled + " tasks.");
                     } else {
-                        // if nothing scheduled, mark chunk as processed to avoid repeated wasteful scans for now
                         scheduledLavaChunks.add(ck);
                     }
                 }
@@ -287,12 +331,6 @@ public class StageManager {
         }
     }
 
-    /**
-     * Планирует преобразование лавы для одного чанка. Возвращает число запланированных задач.
-     *
-     * Временные диапазоны (по вашему предыдущему запросу):
-     * - Лава: 7..15 минут (420..900 сек)
-     */
     private int scheduleLavaDecayForChunk(Chunk chunk) {
         int scheduled = 0;
         ThreadLocalRandom rnd = ThreadLocalRandom.current();
@@ -306,8 +344,7 @@ public class StageManager {
                     Block b = chunk.getBlock(x, y, z);
                     try {
                         if (b.getType() == Material.LAVA && NmsHelper.isOpenToSky(b)) {
-                            // задержка 7..15 минут -> 420..900 секунд
-                            long delaySeconds = 420L + rnd.nextLong(0, 481L); // 420 + [0..480] = 420..900
+                            long delaySeconds = 420L + rnd.nextLong(0, 481L); // 420..900
                             long delayTicks = delaySeconds * 20L;
                             BukkitTask t = Bukkit.getScheduler().runTaskLater(plugin, () -> {
                                 try {
@@ -319,7 +356,7 @@ public class StageManager {
                             }, delayTicks);
                             scheduledDecayTasks.add(t);
                             scheduled++;
-                            if (scheduled >= 1024) break; // safety guard
+                            if (scheduled >= 1024) break;
                         }
                     } catch (Throwable ignored) {}
                 }
@@ -346,9 +383,7 @@ public class StageManager {
     }
 
     public void startAutoStageIfEnabled() {
-        if (config.isAutoStageEnabled()) {
-            startAutoStage();
-        }
+        if (config.isAutoStageEnabled()) startAutoStage();
     }
 
     public void startAutoStage() {
@@ -359,7 +394,7 @@ public class StageManager {
 
     private void autoStageTick() {
         if (!stageInfinite && System.currentTimeMillis() >= stageEndMillis) {
-            int next = (currentStage.ordinal() + 1) % 4;
+            int next = (currentStage.ordinal() + 1) % ColdStage.values().length;
             startStage(next, true);
         }
     }
@@ -371,60 +406,6 @@ public class StageManager {
             autoStageTask = null;
         }
     }
-
-    /**
-     * Запускает задачу, которая каждые N секунд принудительно поддерживает погоду/времени
-     * в зависимости от этапа (0..3). Это нужно, чтобы при рестарте/сне/внешних командах
-     * погода не менялась от ожидаемого поведения этапа.
-     */
-    private void startEnforceTaskForStage(int stageId) {
-        stopEnforceTask();
-
-        enforceStageTask = Bukkit.getScheduler().runTaskTimer(plugin, () -> {
-            try {
-                World w = Bukkit.getWorld("world");
-                if (w == null) return;
-
-                switch (stageId) {
-                    case 0 -> {
-                        if (w.hasStorm()) w.setStorm(false);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-                    }
-                    case 1 -> {
-                        if (!w.hasStorm()) w.setStorm(true);
-                        if (w.isThundering()) w.setThundering(false);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-                    }
-                    case 2 -> {
-                        if (!w.hasStorm()) w.setStorm(true);
-                        if (!w.isThundering()) w.setThundering(true);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        try { w.setGameRuleValue("doDaylightCycle", "true"); } catch (Throwable ignored) {}
-                    }
-                    case 3 -> {
-                        if (!w.hasStorm()) w.setStorm(true);
-                        if (!w.isThundering()) w.setThundering(true);
-                        w.setWeatherDuration(Integer.MAX_VALUE);
-                        w.setTime(18000L);
-                        try { w.setGameRuleValue("doDaylightCycle", "false"); } catch (Throwable ignored) {}
-                    }
-                }
-            } catch (Throwable t) {
-                plugin.getLogger().warning("Ошибка в enforceStageTask: " + t);
-            }
-        }, 1L, 20L * 5L); // каждые 5 секунд
-    }
-
-    private void stopEnforceTask() {
-        if (enforceStageTask != null) {
-            try { enforceStageTask.cancel(); } catch (Throwable ignored) {}
-            enforceStageTask = null;
-        }
-    }
-
-    // Остальные геттеры/утилиты
 
     public ColdStage getCurrentStage() { return currentStage; }
     public long getStageEndMillis() { return stageEndMillis; }
@@ -444,9 +425,7 @@ public class StageManager {
         saveStageState();
     }
 
-    public boolean isStageInfinite() {
-        return stageInfinite;
-    }
+    public boolean isStageInfinite() { return stageInfinite; }
 
     public void onDisable() {
         saveStageState();

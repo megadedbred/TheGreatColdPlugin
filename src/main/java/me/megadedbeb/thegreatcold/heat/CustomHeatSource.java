@@ -14,6 +14,7 @@ import org.bukkit.ChatColor;
 public class CustomHeatSource {
     public static final String TYPE_SMALL_HEATER = "small_heater";
     public static final String TYPE_SEA_HEATER = "sea_heater";
+    public static final String TYPE_MEGA_FURNACE = "mega_furnace"; // новая мегапечь
 
     private final String type;
 
@@ -124,6 +125,8 @@ public class CustomHeatSource {
             title = "Небольшой обогреватель";
         } else if (TYPE_SEA_HEATER.equals(type)) {
             title = "Морской обогреватель";
+        } else if (TYPE_MEGA_FURNACE.equals(type)) {
+            title = "Мегапечь";
         } else {
             title = "Источник тепла";
         }
@@ -132,6 +135,7 @@ public class CustomHeatSource {
         if (isActive()) {
             if (TYPE_SMALL_HEATER.equals(type)) color = ChatColor.GOLD.toString();
             else if (TYPE_SEA_HEATER.equals(type)) color = ChatColor.BLUE.toString();
+            else if (TYPE_MEGA_FURNACE.equals(type)) color = ChatColor.RED.toString();
             else color = ChatColor.GOLD.toString();
         } else {
             color = ChatColor.AQUA.toString();

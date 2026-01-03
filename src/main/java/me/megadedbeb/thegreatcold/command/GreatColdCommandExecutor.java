@@ -1,5 +1,6 @@
 package me.megadedbeb.thegreatcold.command;
 
+import me.megadedbeb.thegreatcold.TheGreatColdPlugin;
 import me.megadedbeb.thegreatcold.config.ConfigManager;
 import me.megadedbeb.thegreatcold.data.DataManager;
 import me.megadedbeb.thegreatcold.freeze.FreezeManager;
@@ -9,12 +10,20 @@ import me.megadedbeb.thegreatcold.heat.CustomHeatManager;
 import me.megadedbeb.thegreatcold.heat.CustomHeatSource;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.NamespacedKey;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
+import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.ItemMeta;
+import org.bukkit.Material;
+import org.bukkit.persistence.PersistentDataType;
+import org.bukkit.ChatColor;
 
 import java.util.Collection;
+import java.util.List;
+import java.util.Map;
 
 public class GreatColdCommandExecutor implements CommandExecutor {
     private final StageManager stageManager;
@@ -24,14 +33,18 @@ public class GreatColdCommandExecutor implements CommandExecutor {
     private final CustomHeatManager customHeatManager;
 
     public GreatColdCommandExecutor(StageManager s, FreezeManager f, ConfigManager c, DataManager d, CustomHeatManager ch) {
-        this.stageManager = s; this.freezeManager = f; this.configManager = c; this.dataManager = d; this.customHeatManager = ch;
+        this.stageManager = s;
+        this.freezeManager = f;
+        this.configManager = c;
+        this.dataManager = d;
+        this.customHeatManager = ch;
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command cmd, String lab, String[] args) {
         if (!sender.hasPermission("greatcold.admin")) return true;
         if (args.length == 0) {
-            sender.sendMessage("§7Доступные подкоманды: stage, autostage, stageinfo, setperiod, freeze, unfreeze, listheaters");
+            sender.sendMessage("§7Доступные подкоманды: stage, autostage, stageinfo, setperiod, freeze, unfreeze, listheaters, giveheater");
             return true;
         }
         switch (args[0].toLowerCase()) {
@@ -72,12 +85,10 @@ public class GreatColdCommandExecutor implements CommandExecutor {
                 int st = Integer.parseInt(args[1]);
                 String val = args[2];
                 if ("infinite".equalsIgnoreCase(val) || "inf".equalsIgnoreCase(val)) {
-                    // Пометить этап как бесконечный если это текущий этап
                     if (stageManager.getCurrentStage().id() == st) {
                         stageManager.setStageInfinite(true);
                         sender.sendMessage("§aТекущий этап " + st + " сделан бесконечным.");
                     }
-                    // Сохраним флаг в dataManager
                     dataManager.setStageInfiniteFlag(true);
                     dataManager.saveAll();
                 } else {
@@ -85,9 +96,8 @@ public class GreatColdCommandExecutor implements CommandExecutor {
                     long millis = mins * 60L * 1000L;
                     configManager.setStageDuration(st, millis);
                     sender.sendMessage("§aВремя этапа "+st+" теперь "+mins+" мин.");
-                    // если изменили длительность текущего этапа и он не бесконечен — обновить окончание
                     if (stageManager.getCurrentStage().id() == st && !stageManager.isStageInfinite()) {
-                        stageManager.setStageInfinite(false); // recompute end
+                        stageManager.setStageInfinite(false);
                         sender.sendMessage("§aОбновлён таймер текущего этапа.");
                     }
                 }
@@ -133,6 +143,58 @@ public class GreatColdCommandExecutor implements CommandExecutor {
                         idx++;
                     }
                 }
+            }
+            case "giveheater" -> {
+                if (!(sender instanceof Player)) {
+                    sender.sendMessage("§cOnly players can receive items.");
+                    return true;
+                }
+                if (args.length < 2) {
+                    sender.sendMessage("§cИспользование: /greatcold giveheater <small_heater|sea_heater|mega_furnace>");
+                    return true;
+                }
+                String type = args[1].toLowerCase();
+                ItemStack item;
+                ItemMeta meta;
+                NamespacedKey key = new NamespacedKey(TheGreatColdPlugin.getInstance(), "heater_type");
+                if ("small_heater".equals(type) || "small".equals(type)) {
+                    item = new ItemStack(Material.SHROOMLIGHT);
+                    meta = item.getItemMeta();
+                    if (meta != null) {
+                        meta.setDisplayName(ChatColor.GOLD + "Небольшой обогреватель");
+                        meta.setLore(List.of("Обогревает небольшую зону, но и требует " + ChatColor.GOLD + "немного топлива" + ChatColor.RESET + ".",
+                                "Нельзя сломать."));
+                        meta.getPersistentDataContainer().set(key, PersistentDataType.STRING, CustomHeatSource.TYPE_SMALL_HEATER);
+                        item.setItemMeta(meta);
+                    }
+                } else if ("sea_heater".equals(type) || "sea".equals(type)) {
+                    item = new ItemStack(Material.SEA_LANTERN);
+                    meta = item.getItemMeta();
+                    if (meta != null) {
+                        meta.setDisplayName(ChatColor.BLUE + "Морской обогреватель");
+                        meta.setLore(List.of("Использует силу " + ChatColor.BLUE + "Морского" + ChatColor.RESET + " источника, вмещает мало топлива."));
+                        meta.getPersistentDataContainer().set(key, PersistentDataType.STRING, CustomHeatSource.TYPE_SEA_HEATER);
+                        item.setItemMeta(meta);
+                    }
+                } else if ("mega_furnace".equals(type) || "mega".equals(type)) {
+                    item = new ItemStack(Material.MAGMA_BLOCK);
+                    meta = item.getItemMeta();
+                    if (meta != null) {
+                        meta.setDisplayName(ChatColor.RED + "Мегапечь");
+                        meta.setLore(List.of("Мощная печь, вмещает много топлива."));
+                        meta.getPersistentDataContainer().set(key, PersistentDataType.STRING, CustomHeatSource.TYPE_MEGA_FURNACE);
+                        item.setItemMeta(meta);
+                    }
+                } else {
+                    sender.sendMessage("§cНеизвестный тип: " + type);
+                    return true;
+                }
+                Player p = (Player) sender;
+                Map<Integer, ItemStack> leftover = p.getInventory().addItem(item);
+                if (!leftover.isEmpty()) {
+                    p.getWorld().dropItemNaturally(p.getLocation(), item);
+                }
+                p.sendMessage("§aПредмет выдан: " + type);
             }
             default -> sender.sendMessage("§cНеизвестная подкоманда.");
         }

@@ -25,13 +25,15 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.ArrayDeque;
 
 /**
- * CustomHeatManager — управляет кастомными источниками тепла (small_heater и sea_heater).
+ * CustomHeatManager — управляет кастомными источниками тепла (small_heater, sea_heater, mega_furnace).
  *
- * Изменения:
- * - Морской обогреватель теперь тратит топливо независимо от загрузки чанка (как и небольшой).
- *   Визуалы/таяние по-прежнему требуют загруженного чанка/воды для отображения/эффекта.
+ * Особенности:
+ * - Сохранение/загрузка кастомных источников (fuelMillis + позиция).
+ * - Голограммы (ArmorStand), частицы, таяние снега/льда.
+ * - Мегапечь: большой радиус, особое топливо, плавный поджог и визуалы.
  *
- * Остальная логика: восстановление/сохранение, голограммы, частицы, BFS-таяние — сохранена.
+ * Сообщения игроку берутся из ConfigManager (messages.*).
+ * Некоторые сообщения по запросу пользователя больше не отправляются (см. изменения).
  */
 public class CustomHeatManager implements Listener {
     private final TheGreatColdPlugin plugin;
@@ -50,6 +52,9 @@ public class CustomHeatManager implements Listener {
     private static final long SAVE_INTERVAL_MS = 60_000L;
     private long tickCounter = 0L;
     private static final int MELT_INTERVAL_TICKS = 5;
+
+    // random для постепенного поджигания
+    private final Random random = new Random();
 
     public CustomHeatManager(TheGreatColdPlugin plugin, DataManager dataManager) {
         this.plugin = plugin;
@@ -111,8 +116,11 @@ public class CustomHeatManager implements Listener {
                     sources.put(key, s);
                 } else if (CustomHeatSource.TYPE_SEA_HEATER.equals(type)) {
                     long max = 8L * 60L * 60L * 1000L; // 8 hours
-                    // radius previously set elsewhere; keep stored radius when creating source — default used here is 41 in other code paths
                     CustomHeatSource s = new CustomHeatSource(type, loc, 41, max, fuel);
+                    sources.put(key, s);
+                } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(type)) {
+                    long max = 45L * 60L * 60L * 1000L; // 45 hours
+                    CustomHeatSource s = new CustomHeatSource(type, loc, 121, max, fuel);
                     sources.put(key, s);
                 } else {
                     toRemove.add(dto);
@@ -173,6 +181,8 @@ public class CustomHeatManager implements Listener {
                 if (b != null && (b.getType() == Material.COAL_BLOCK || b.getType() == Material.SHROOMLIGHT)) valid = true;
             } else if (CustomHeatSource.TYPE_SEA_HEATER.equals(s.getType())) {
                 if (b != null && (b.getType() == Material.COAL_BLOCK || b.getType() == Material.SEA_LANTERN)) valid = true;
+            } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+                if (b != null && (b.getType() == Material.COAL_BLOCK || b.getType() == Material.MAGMA_BLOCK)) valid = true;
             }
 
             if (!valid) {
@@ -231,13 +241,22 @@ public class CustomHeatManager implements Listener {
             dataManager.saveAll();
         } else if (CustomHeatSource.TYPE_SEA_HEATER.equals(type)) {
             long max = 8L * 60L * 60L * 1000L;
-            // radius set to 41 as requested
             CustomHeatSource s = new CustomHeatSource(type, blockLoc, 41, max, 0L);
             sources.put(key, s);
             purgeSavedCustomSourcesAt(blockLoc);
             dataManager.addSavedCustomSource(s);
             Block b = getSourceBlock(s);
             if (b != null) b.setType(Material.COAL_BLOCK, false);
+            spawnHologramsIfNeeded(s);
+            dataManager.saveAll();
+        } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(type)) {
+            long max = 45L * 60L * 60L * 1000L; // 45 hours
+            CustomHeatSource s = new CustomHeatSource(type, blockLoc, 121, max, 0L);
+            sources.put(key, s);
+            purgeSavedCustomSourcesAt(blockLoc);
+            dataManager.addSavedCustomSource(s);
+            Block b = getSourceBlock(s);
+            if (b != null) b.setType(Material.MAGMA_BLOCK, false);
             spawnHologramsIfNeeded(s);
             dataManager.saveAll();
         }
@@ -332,6 +351,8 @@ public class CustomHeatManager implements Listener {
                     effectiveActive = (above != null && above.getType() == Material.WATER);
                 }
                 if (effectiveActive) spawnSeaParticles(s);
+            } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+                if (s.isActive()) spawnMegaParticles(s);
             } else {
                 if (s.isActive()) spawnParticles(s);
             }
@@ -368,6 +389,11 @@ public class CustomHeatManager implements Listener {
 
             // Also ensure visuals reflect effective active state (sea heater might have fuel but no water -> inactive visual)
             try { updateVisuals(s); } catch (Throwable ignored) {}
+
+            // Special behaviour for megafurnace: ignition within small radius (gradual)
+            if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType()) && s.isActive()) {
+                try { applyMegaIgnition(s); } catch (Throwable ignored) {}
+            }
         }
 
         long now = System.currentTimeMillis();
@@ -398,6 +424,9 @@ public class CustomHeatManager implements Listener {
                 Block above = b.getRelative(0,1,0);
                 boolean activeEffective = (s.isActive() && above != null && above.getType() == Material.WATER);
                 if (activeEffective) b.setType(Material.SEA_LANTERN, false);
+                else b.setType(Material.COAL_BLOCK, false);
+            } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+                if (s.isActive()) b.setType(Material.MAGMA_BLOCK, false);
                 else b.setType(Material.COAL_BLOCK, false);
             } else {
                 if (s.isActive()) b.setType(Material.SHROOMLIGHT, false);
@@ -431,6 +460,8 @@ public class CustomHeatManager implements Listener {
             Block above = block.getRelative(0,1,0);
             boolean effectiveActive = (s.isActive() && above != null && above.getType() == Material.WATER);
             displayName = (effectiveActive ? (ChatColor.BLUE.toString() + "Морской обогреватель") : (ChatColor.AQUA.toString() + "Морской обогреватель"));
+        } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+            displayName = (s.isActive() ? (ChatColor.RED.toString() + "Мегапечь") : (ChatColor.AQUA.toString() + "Мегапечь"));
         } else {
             displayName = (s.isActive() ? (ChatColor.GOLD.toString() + "Небольшой обогреватель") : (ChatColor.AQUA.toString() + "Небольшой обогреватель"));
         }
@@ -557,6 +588,18 @@ public class CustomHeatManager implements Listener {
         } catch (Throwable ignored) {}
     }
 
+    private void spawnMegaParticles(CustomHeatSource s) {
+        try {
+            Block b = getSourceBlock(s);
+            if (b == null) return;
+            World w = b.getWorld();
+            Location center = new Location(w, b.getX() + 0.5, b.getY() + 0.9, b.getZ() + 0.5);
+            w.spawnParticle(Particle.DRIPPING_LAVA, center, 16, 1.5, 1.0, 1.5, 0.05);
+            Location top = new Location(w, b.getX() + 0.5, b.getY() + 1.6, b.getZ() + 0.5);
+            w.spawnParticle(Particle.FLAME, top, 6, 0.5, 0.5, 0.5, 0.02);
+        } catch (Throwable ignored) {}
+    }
+
     /**
      * Центрированный BFS melt с адаптивными лимитами.
      * Использует s.getRadius() (для sea_heater значение задаётся при создании).
@@ -575,8 +618,14 @@ public class CustomHeatManager implements Listener {
         final int MAX_MELTS_SEA = 256;
         final int MAX_MELTS_SMALL = 64;
 
-        final int MAX_SEARCH_NODES = CustomHeatSource.TYPE_SEA_HEATER.equals(s.getType()) ? MAX_SEARCH_NODES_SEA : MAX_SEARCH_NODES_SMALL;
-        final int localMaxMelt = CustomHeatSource.TYPE_SEA_HEATER.equals(s.getType()) ? MAX_MELTS_SEA : MAX_MELTS_SMALL;
+        // For mega furnace use larger caps but still bounded
+        final int MAX_SEARCH_NODES_MEGA = 500_000;
+        final int MAX_MELTS_MEGA = 1024;
+
+        final int MAX_SEARCH_NODES = CustomHeatSource.TYPE_SEA_HEATER.equals(s.getType()) ? MAX_SEARCH_NODES_SEA
+                : (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType()) ? MAX_SEARCH_NODES_MEGA : MAX_SEARCH_NODES_SMALL);
+        final int localMaxMelt = CustomHeatSource.TYPE_SEA_HEATER.equals(s.getType()) ? MAX_MELTS_SEA
+                : (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType()) ? MAX_MELTS_MEGA : MAX_MELTS_SMALL);
 
         int melted = 0;
 
@@ -731,27 +780,52 @@ public class CustomHeatManager implements Listener {
         Player p = ev.getPlayer();
         ItemStack inHand = p.getInventory().getItemInMainHand();
 
+        // admin brush removal: keep this behaviour
         if (inHand != null && inHand.getType() == Material.BRUSH && p.hasPermission("greatcold.admin")) {
             ev.setCancelled(true);
             removeSourceAt(clicked.getLocation());
-            p.sendMessage("§aИсточник тепла удалён.");
+            // still notify admin
+            p.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat_source.removed"));
             return;
         }
 
-        if (inHand == null || inHand.getType() == Material.AIR) return;
+        // For mega furnace: restrict interactions to allowed fuel items only
+        if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+            // if no item in hand — disallow interaction (but do not send the removed message per request)
+            if (inHand == null || inHand.getType() == Material.AIR) {
+                ev.setCancelled(true);
+                return;
+            }
+            Integer minutes = minutesForFuel(inHand.getType(), inHand, s);
+            if (minutes == null) {
+                // explicitly block other interactions on mega-furnace (no message)
+                ev.setCancelled(true);
+                return;
+            }
+            ev.setCancelled(true);
+        } else {
+            // existing behaviour for other heaters: if no item or air -> ignore
+            if (inHand == null || inHand.getType() == Material.AIR) return;
+            Integer minutes = minutesForFuel(inHand.getType(), inHand, s);
+            if (minutes == null) {
+                // previously sent "not_fuel" message — now silent
+                return;
+            }
+            ev.setCancelled(true);
+        }
 
+        // At this point: inHand is known and minutesForFuel returned non-null
         Integer minutes = minutesForFuel(inHand.getType(), inHand, s);
         if (minutes == null) {
-            p.sendMessage("§cЭтот предмет не является топливом для этого обогревателя.");
+            // silent per request
             return;
         }
-        ev.setCancelled(true);
 
         long perItemMillis = minutes * 60L * 1000L;
         long spaceLeft = s.getMaxFuelMillis() - s.getFuelMillis();
 
         if (spaceLeft <= 0) {
-            p.sendMessage("§cТопливо больше не вмещается!");
+            p.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat_source.fuel_full"));
             p.getWorld().playSound(p.getLocation(), Sound.BLOCK_ANVIL_LAND, 0.8f, 1.2f);
             return;
         }
@@ -759,46 +833,72 @@ public class CustomHeatManager implements Listener {
         boolean sneak = p.isSneaking();
         int requested = sneak ? inHand.getAmount() : 1;
 
+        // Special case: items that give 0 minutes (e.g. stick for megafurnace) — consume them but do not add fuel.
+        if (perItemMillis == 0L) {
+            int toConsume = Math.min(requested, inHand.getAmount());
+            consumePlayerItems(p, toConsume, inHand.getType());
+            p.getWorld().playSound(p.getLocation(), Sound.ITEM_FIRECHARGE_USE, 1.0f, 1.0f);
+            // previously would send fuel_used_but_zero — now silent
+            return;
+        }
+
         int maxItemsFit = (int) (spaceLeft / perItemMillis);
         boolean allowPartial = (spaceLeft > 0 && maxItemsFit == 0);
 
         if (!sneak) {
             if (maxItemsFit >= 1) {
                 s.addFuelMillis(perItemMillis);
-                consumePlayerItems(p, 1);
+                consumePlayerItems(p, 1, inHand.getType());
             } else if (allowPartial) {
                 s.addFuelMillis(spaceLeft);
-                consumePlayerItems(p, 1);
+                consumePlayerItems(p, 1, inHand.getType());
             } else {
-                p.sendMessage("§cТопливо больше не вмещается!");
+                p.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat_source.fuel_full"));
                 return;
             }
         } else {
             if (maxItemsFit <= 0) {
                 if (allowPartial) {
                     s.addFuelMillis(spaceLeft);
-                    consumePlayerItems(p, 1);
+                    consumePlayerItems(p, 1, inHand.getType());
                 } else {
-                    p.sendMessage("§cТопливо больше не вмещается!");
+                    p.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat_source.fuel_full"));
                     p.getWorld().playSound(p.getLocation(), Sound.BLOCK_ANVIL_LAND, 0.8f, 1.2f);
                     return;
                 }
             } else {
                 int toConsume = Math.min(requested, maxItemsFit);
                 s.addFuelMillis(perItemMillis * toConsume);
-                consumePlayerItems(p, toConsume);
+                consumePlayerItems(p, toConsume, inHand.getType());
             }
         }
 
         updateVisuals(s);
         p.getWorld().playSound(p.getLocation(), Sound.ITEM_FIRECHARGE_USE, 1.0f, 1.0f);
-        p.sendMessage("§aТопливо добавлено. Текущее: " + s.getFuelPercent() + "%");
+        String fuelAddedMsg = TheGreatColdPlugin.getInstance().getConfigManager().getMessage("heat_source.fuel_added", s.getFuelPercent());
+        p.sendMessage(fuelAddedMsg);
     }
 
-    private void consumePlayerItems(Player p, int count) {
+    /**
+     * Special consume: keep bucket when LAVA_BUCKET is used, otherwise decrease normally.
+     */
+    private void consumePlayerItems(Player p, int count, Material mat) {
         ItemStack hand = p.getInventory().getItemInMainHand();
         if (hand == null) return;
         int left = hand.getAmount() - count;
+
+        // Special handling for lava bucket -> return empty bucket
+        if (mat == Material.LAVA_BUCKET) {
+            if (left <= 0) {
+                p.getInventory().setItemInMainHand(new ItemStack(Material.BUCKET));
+            } else {
+                hand.setAmount(left);
+                HashMap<Integer, ItemStack> couldnt = p.getInventory().addItem(new ItemStack(Material.BUCKET));
+                if (!couldnt.isEmpty()) p.getWorld().dropItemNaturally(p.getLocation(), new ItemStack(Material.BUCKET));
+            }
+            return;
+        }
+
         if (left <= 0) p.getInventory().setItemInMainHand(new ItemStack(Material.AIR));
         else hand.setAmount(left);
     }
@@ -806,6 +906,22 @@ public class CustomHeatManager implements Listener {
     private Integer minutesForFuel(Material mat, ItemStack stack, CustomHeatSource s) {
         String name = mat.name();
 
+        // Mega furnace fuel rules (user-specified)
+        if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+            if (mat == Material.COAL || mat == Material.CHARCOAL) return 3;
+            if (mat == Material.COAL_BLOCK) return 27; // changed per request: 27 minutes
+            if (name.endsWith("_LOG") || name.endsWith("_WOOD") || (name.startsWith("STRIPPED_") && (name.contains("_LOG") || name.contains("_WOOD")))) return 3;
+            if (name.endsWith("_PLANKS")) return 1;
+            for (String w : new String[]{"OAK","SPRUCE","BIRCH","JUNGLE","ACACIA","DARK_OAK","MANGROVE","CHERRY"}) {
+                if (name.equals(w + "_SLAB")) return 1;
+            }
+            if (mat == Material.STICK) return 0; // allowed but 0 minutes
+            if (mat == Material.LAVA_BUCKET) return 30;
+            if (mat == Material.MAGMA_BLOCK) return 6;
+            // Fallback: treat other items same as small heater mapping (as before)
+        }
+
+        // For sea heater
         if (CustomHeatSource.TYPE_SEA_HEATER.equals(s.getType())) {
             if (mat == Material.MAGMA_BLOCK) return 10;
             if (mat == Material.COAL_BLOCK) return 40;
@@ -822,6 +938,7 @@ public class CustomHeatManager implements Listener {
             return null;
         }
 
+        // Default (small heater) logic
         Integer base = null;
         if (mat == Material.COAL_BLOCK) base = 81;
         else if (mat == Material.COAL || mat == Material.CHARCOAL) base = 9;
@@ -874,6 +991,9 @@ public class CustomHeatManager implements Listener {
                     boolean activeEffective = (s.isActive() && above != null && above.getType() == Material.WATER);
                     if (activeEffective) b.setType(Material.SEA_LANTERN, false);
                     else b.setType(Material.COAL_BLOCK, false);
+                } else if (CustomHeatSource.TYPE_MEGA_FURNACE.equals(s.getType())) {
+                    if (s.isActive()) b.setType(Material.MAGMA_BLOCK, false);
+                    else b.setType(Material.COAL_BLOCK, false);
                 } else {
                     if (s.isActive()) b.setType(Material.SHROOMLIGHT, false);
                     else b.setType(Material.COAL_BLOCK, false);
@@ -905,6 +1025,63 @@ public class CustomHeatManager implements Listener {
 
         for (CustomHeatSource s : sources.values()) {
             try { despawnHolograms(s); } catch (Throwable ignored) {}
+        }
+    }
+
+    /**
+     * Поджигает сущности/игроков и аккуратно (постепенно) устанавливает огонь поверх горючих блоков
+     * в радиусе 3 блоков вокруг мегапечи.
+     *
+     * Правила:
+     * - Не поджигаем воздух/воду/лаву напрямую.
+     * - Не заменяем существующие блоки на огонь (ставим FIRE только если над подходящим блоком сейчас AIR).
+     * - Ограниченное число случайных попыток поджига в тик (чтобы было плавно).
+     */
+    private void applyMegaIgnition(CustomHeatSource s) {
+        Block b = getSourceBlock(s);
+        if (b == null) return;
+        World w = b.getWorld();
+        int r = 3;
+        int cx = b.getX(), cy = b.getY(), cz = b.getZ();
+
+        // entities: give a chance to ignite per-tick
+        try {
+            for (Entity e : w.getNearbyEntities(new Location(w, cx + 0.5, cy + 0.5, cz + 0.5), r, r, r)) {
+                try {
+                    if (random.nextDouble() < 0.35) {
+                        e.setFireTicks(3 * 20); // 3 seconds
+                    }
+                } catch (Throwable ignored) {}
+            }
+        } catch (Throwable ignored) {}
+
+        // blocks: several random attempts per tick
+        int attempts = 6;
+        for (int i = 0; i < attempts; i++) {
+            int dx = random.nextInt(r * 2 + 1) - r;
+            int dy = random.nextInt(3) - 1; // -1..1
+            int dz = random.nextInt(r * 2 + 1) - r;
+            int x = cx + dx, y = cy + dy, z = cz + dz;
+            try {
+                if (!w.isChunkLoaded(Math.floorDiv(x, 16), Math.floorDiv(z, 16))) continue;
+                Block base = w.getBlockAt(x, y, z);
+                if (base == null) continue;
+                Block above = base.getRelative(0,1,0);
+                if (above == null) continue;
+                if (above.getType() != Material.AIR) continue;
+
+                Material baseMat = base.getType();
+                if (baseMat == Material.AIR || baseMat == Material.WATER || baseMat == Material.LAVA) continue;
+
+                String nm = baseMat.name();
+                boolean flammable = nm.endsWith("_LOG") || nm.endsWith("_WOOD") || nm.endsWith("_PLANKS")
+                        || nm.endsWith("_LEAVES") || nm.endsWith("_WOOL") || nm.equals("HAY_BLOCK")
+                        || nm.endsWith("_CARPET") || nm.equals("TNT");
+
+                if (!flammable) continue;
+
+                try { above.setType(Material.FIRE, false); } catch (Throwable ignored) {}
+            } catch (Throwable ignored) {}
         }
     }
 }

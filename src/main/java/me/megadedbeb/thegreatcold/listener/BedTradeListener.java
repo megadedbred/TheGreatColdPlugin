@@ -9,13 +9,16 @@ import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.block.Block;
 import org.bukkit.entity.Player;
-import org.bukkit.entity.Villager;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.player.PlayerBedEnterEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 
+/**
+ * Listener для сна/установки точки респауна и (частично) торговли.
+ * Сообщение при попытке установить спавн на этапе 3/2 больше не отправляется игроку (по запросу).
+ */
 public class BedTradeListener implements Listener {
     private final HeatSourceManager heatManager;
     private final FreezeManager freezeManager;
@@ -23,9 +26,11 @@ public class BedTradeListener implements Listener {
 
     public BedTradeListener(HeatSourceManager heatManager, FreezeManager freezeManager) {
         this.heatManager = heatManager;
-        this.freezeManager = freezeManager;
+        this.freezeManager = freeze_manager_fix(freezeManager);
         this.customHeatManager = TheGreatColdPlugin.getInstance().getCustomHeatManager();
     }
+
+    private FreezeManager freeze_manager_fix(FreezeManager f) { return f; }
 
     @EventHandler
     public void onBedEnter(PlayerBedEnterEvent event) {
@@ -33,7 +38,15 @@ public class BedTradeListener implements Listener {
         if (!player.getWorld().getName().equals("world")) return;
 
         int globalStageId = TheGreatColdPlugin.getInstance().getStageManager().getCurrentStage().id();
-        // Отмена сна без источника тепла нужна ТОЛЬКО на этапах 2 и 3
+
+        // Full deny: on stage 3 players cannot sleep at all.
+        if (globalStageId == 3) {
+            event.setCancelled(true);
+            player.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("bed.cant_sleep"));
+            return;
+        }
+
+        // For stage 2: require heat (older behavior)
         if (globalStageId < 2) return;
 
         boolean rawInHeat = heatManager.isPlayerInHeat(player);
@@ -43,7 +56,7 @@ public class BedTradeListener implements Listener {
 
         if (!effectiveInHeat) {
             event.setCancelled(true);
-            player.sendMessage("§cВы не можете спать — слишком холодно!");
+            player.sendMessage(TheGreatColdPlugin.getInstance().getConfigManager().getMessage("bed.cant_sleep"));
         }
     }
 
@@ -58,7 +71,14 @@ public class BedTradeListener implements Listener {
         // Запрет установки точки возрождения (правый клик по кровати)
         if (clicked.getType().name().endsWith("_BED")) {
             int globalStageId = TheGreatColdPlugin.getInstance().getStageManager().getCurrentStage().id();
-            // Ограничение действует ТОЛЬКО на этапах 2 и 3
+
+            // Full deny setting spawn on stage 3
+            if (globalStageId == 3) {
+                event.setCancelled(true);
+                // previously sent cant_set_spawn — now silent per request
+                return;
+            }
+
             if (globalStageId < 2) return;
 
             boolean rawInHeat = heatManager.isPlayerInHeat(player);
@@ -68,7 +88,7 @@ public class BedTradeListener implements Listener {
 
             if (globalStageId >= 2 && !effectiveInHeat) {
                 event.setCancelled(true);
-                player.sendMessage("§cВы не можете установить точку респауна — слишком холодно!");
+                // previously sent cant_set_spawn — now silent per request
             }
         }
 

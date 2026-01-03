@@ -50,8 +50,12 @@ public class HeatSourceManager implements Listener {
 
         Bukkit.getPluginManager().registerEvents(this, plugin);
 
-        // Восстанавливаем сохранённые источники (из data.yml), но при этом очистим устаревшие записи lava
-        restoreSavedHeatSources();
+        // Мы больше не сохраняем natural heat sources в data.yml.
+        // Очистим возможные старые записи в data.yml, чтобы не оставлять устаревшие записи.
+        try {
+            dataManager.clearSavedHeatSources();
+            dataManager.saveAll();
+        } catch (Throwable ignored) {}
 
         // Редкая проверка «здоровья» активных регионов, но только рядом с игроками
         startValidationTask();
@@ -62,56 +66,12 @@ public class HeatSourceManager implements Listener {
     public void scanWorldForHeatSources() {
         activeRegions.clear();
         chunkIndex.clear();
-        restoreSavedHeatSources();
 
         // Запускаем инкрементное сканирование загруженных чанков (чтобы найти природные источники, лаву и т.п.)
         for (World world : Bukkit.getWorlds()) {
             for (Chunk chunk : world.getLoadedChunks()) {
                 scanChunkForHeat(chunk);
             }
-        }
-    }
-
-    private void restoreSavedHeatSources() {
-        Collection<HeatSourceRegion> saved = new ArrayList<>(dataManager.getSavedHeatSources());
-        List<Location> toRemove = new ArrayList<>();
-        for (HeatSourceRegion r : saved) {
-            Location loc = r.getCenter();
-            try {
-                String world = loc.getWorld().getName();
-                Block block = loc.getBlock();
-                // If block no longer exists or type is not heat-providing — mark to remove
-                if (block == null) {
-                    toRemove.add(loc);
-                    continue;
-                }
-                Material mat = block.getType();
-                // If saved entry refers to lava, we do NOT want to keep it persistent — remove it.
-                if (mat == Material.LAVA) {
-                    toRemove.add(loc);
-                    continue;
-                }
-                if (HEAT_SOURCES.contains(mat) && providesHeat(block)) {
-                    String sourceKey = keyFor(loc);
-                    activeRegions.put(sourceKey, r);
-                    String chunkKey = chunkKeyFor(loc.getChunk());
-                    chunkIndex.computeIfAbsent(chunkKey, k -> new HashSet<>()).add(sourceKey);
-                } else {
-                    toRemove.add(loc);
-                }
-            } catch (Exception ignored) {
-                toRemove.add(r.getCenter());
-            }
-        }
-        // Удаляем невалидные записи из персистентного хранилища
-        for (Location loc : toRemove) {
-            dataManager.removeSavedHeatSourceByLocation(loc);
-        }
-        if (!toRemove.isEmpty()) {
-            try {
-                dataManager.saveAll(); // сохранить очищенный state сразу
-                plugin.getLogger().info("[TheGreatCold] Removed " + toRemove.size() + " invalid/persistent lava heat_sources entries from data.yml");
-            } catch (Throwable ignored) {}
         }
     }
 
@@ -275,8 +235,7 @@ public class HeatSourceManager implements Listener {
         for (String key : toRemove) {
             HeatSourceRegion removed = activeRegions.remove(key);
             if (removed != null) {
-                // do NOT persist lava removal here specially — just remove indexing and persistent data if any
-                dataManager.removeSavedHeatSourceByLocation(removed.getCenter());
+                // do NOT persist or remove persisted data for natural sources — we don't persist them
                 String ck = chunkKeyFor(removed.getCenter().getChunk());
                 Set<String> set = chunkIndex.get(ck);
                 if (set != null) {
@@ -336,10 +295,7 @@ public class HeatSourceManager implements Listener {
         String chunkKey = chunkKeyFor(block.getLocation().getChunk());
         chunkIndex.computeIfAbsent(chunkKey, k -> new HashSet<>()).add(sourceKey);
 
-        // IMPORTANT: do NOT persist lava blocks (we want lava to be transient and not saved to data.yml)
-        if (type != null && type != HeatSourceType.LAVA) {
-            dataManager.addSavedHeatSource(region);
-        }
+        // IMPORTANT: do NOT persist natural heat blocks to data.yml (they are discovered dynamically)
     }
 
     public void removeHeatSource(Block block) {
@@ -352,9 +308,9 @@ public class HeatSourceManager implements Listener {
                 set.remove(sourceKey);
                 if (set.isEmpty()) chunkIndex.remove(ck);
             }
-            dataManager.removeSavedHeatSourceByLocation(removed.getCenter());
+            // we intentionally do not touch persistent storage for natural sources
         } else {
-            dataManager.removeSavedHeatSourceByLocation(block.getLocation());
+            // nothing persisted for natural sources -> nothing to remove
         }
     }
 

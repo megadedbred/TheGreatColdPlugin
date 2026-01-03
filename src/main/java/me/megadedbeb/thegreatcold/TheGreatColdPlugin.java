@@ -9,6 +9,7 @@ import me.megadedbeb.thegreatcold.heat.HeatSourceManager;
 import me.megadedbeb.thegreatcold.heat.CustomHeatManager;
 import me.megadedbeb.thegreatcold.stage.StageManager;
 import me.megadedbeb.thegreatcold.listener.*;
+import me.megadedbeb.thegreatcold.listener.HeatedHatListener;
 import org.bukkit.Bukkit;
 import org.bukkit.NamespacedKey;
 import org.bukkit.inventory.ItemStack;
@@ -17,7 +18,9 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.Material;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.ChatColor;
 
+import java.util.ArrayList;
 import java.util.List;
 
 public class TheGreatColdPlugin extends JavaPlugin {
@@ -29,38 +32,45 @@ public class TheGreatColdPlugin extends JavaPlugin {
     private HeatSourceManager heatSourceManager;
     private CustomHeatManager customHeatManager;
 
+    // key to mark Heated Hat
+    private NamespacedKey heatedHatKey;
+    private NamespacedKey heatedHatDurKey;
+
+    public static final int HEATED_HAT_MAX_DUR = 200; // final durability
+
     @Override
     public void onEnable() {
         instance = this;
 
-        // Менеджеры
+        heatedHatKey = new NamespacedKey(this, "heated_hat");
+        heatedHatDurKey = new NamespacedKey(this, "heated_hat_dur");
+
         configManager = new ConfigManager(this);
         dataManager = new DataManager(this);
 
-        // custom heat manager first (it registers its own listeners)
         customHeatManager = new CustomHeatManager(this, dataManager);
 
         heatSourceManager = new HeatSourceManager(this, dataManager, customHeatManager);
         stageManager = new StageManager(this, configManager, dataManager, heatSourceManager);
-        freezeManager = new FreezeManager(this, configManager, dataManager, heatSourceManager, stageManager);
+        // create freeze manager after stage manager (order)
+        this.freezeManager = new FreezeManager(this, configManager, dataManager, heatSourceManager, stageManager);
 
-        // Лисенеры — регистрируем все используемые слушатели
-        // CustomHeatManager & HeatSourceManager уже регистрируются внутри своих конструкторов
+        // register listeners
         Bukkit.getPluginManager().registerEvents(new EntitySpawnListener(stageManager), this);
         Bukkit.getPluginManager().registerEvents(new PlayerMoveListener(freezeManager, heatSourceManager), this);
         Bukkit.getPluginManager().registerEvents(new PlayerDeathListener(freezeManager), this);
         Bukkit.getPluginManager().registerEvents(new BedTradeListener(heatSourceManager, freezeManager), this);
         Bukkit.getPluginManager().registerEvents(new BlockHeatListener(heatSourceManager), this);
-        Bukkit.getPluginManager().registerEvents(new CropListener(heatSourceManager), this); // обработка роста культур и костной муки
-
-        // SleepListener будит спящих на этапе 3, но не отменяет сон глобально
+        Bukkit.getPluginManager().registerEvents(new CropListener(heatSourceManager), this);
         Bukkit.getPluginManager().registerEvents(new SleepListener(heatSourceManager), this);
-
-        // Новая логика: запрет создания порталов
         Bukkit.getPluginManager().registerEvents(new me.megadedbeb.thegreatcold.listener.PortalCreateListener(), this);
+        Bukkit.getPluginManager().registerEvents(new AnimalBreedListener(), this);
 
-        // Команды
-        GreatColdCommandExecutor commandExecutor = new GreatColdCommandExecutor(stageManager, freezeManager, configManager, dataManager);
+        // heated hat listener
+        Bukkit.getPluginManager().registerEvents(new HeatedHatListener(this), this);
+
+        // commands
+        GreatColdCommandExecutor commandExecutor = new GreatColdCommandExecutor(stageManager, freezeManager, configManager, dataManager, customHeatManager);
         if (getCommand("greatcold") != null) {
             getCommand("greatcold").setExecutor(commandExecutor);
             getCommand("greatcold").setTabCompleter(new GreatColdTabCompleter());
@@ -68,14 +78,13 @@ public class TheGreatColdPlugin extends JavaPlugin {
             getLogger().warning("Команда greatcold не зарегистрирована в plugin.yml");
         }
 
-        // Register recipe for small heater
+        // recipes
         registerSmallHeaterRecipe();
+        registerSeaHeaterRecipe();
+        registerMegaFurnaceRecipe();
+        registerHeatedHatRecipe();
 
-        // Автостарт 0 этапа если требуется (если этап не задан в данных)
-        if (!stageManager.isStageSet()) {
-            stageManager.startStage(0, false);
-        }
-
+        if (!stageManager.isStageSet()) stageManager.startStage(0, false);
         stageManager.startAutoStageIfEnabled();
     }
 
@@ -85,11 +94,11 @@ public class TheGreatColdPlugin extends JavaPlugin {
         if (meta != null) {
             NamespacedKey key = new NamespacedKey(this, "heater_type");
             meta.getPersistentDataContainer().set(key, PersistentDataType.STRING, "small_heater");
-            meta.setDisplayName(org.bukkit.ChatColor.GOLD + "Небольшой обогреватель");
-            meta.setLore(List.of("§7Обогревает небольшую зону, но и требует не много энергии.", "§7Неразрушаемый."));
+            meta.setDisplayName(ChatColor.GOLD + "Небольшой обогреватель");
+            meta.setLore(List.of("Обогревает небольшую зону, но и требует " + ChatColor.GOLD + "немного топлива" + ChatColor.RESET + ".",
+                    "Нельзя сломать."));
             result.setItemMeta(meta);
         }
-
         NamespacedKey rkey = new NamespacedKey(this, "small_heater");
         ShapedRecipe recipe = new ShapedRecipe(rkey, result);
         recipe.shape("AAA", "BFB", "CMC");
@@ -98,13 +107,86 @@ public class TheGreatColdPlugin extends JavaPlugin {
         recipe.setIngredient('F', Material.BLAST_FURNACE);
         recipe.setIngredient('C', Material.COPPER_INGOT);
         recipe.setIngredient('M', Material.MAGMA_BLOCK);
+        Bukkit.addRecipe(recipe);
+    }
 
+    private void registerSeaHeaterRecipe() {
+        ItemStack result = new ItemStack(Material.SEA_LANTERN);
+        ItemMeta meta = result.getItemMeta();
+        if (meta != null) {
+            NamespacedKey key = new NamespacedKey(this, "heater_type");
+            meta.getPersistentDataContainer().set(key, PersistentDataType.STRING, "sea_heater");
+            meta.setDisplayName(ChatColor.BLUE + "Морской обогреватель");
+            String line1 = "Использует силу " + ChatColor.BLUE + "Морского" + ChatColor.RESET + " " + ChatColor.BLUE + "источника" + ChatColor.RESET + " и создает теплый пар на большой территории,";
+            String line2 = "вмещает мало, но " + ChatColor.GOLD + "расходует много топлива" + ChatColor.RESET + ". Нельзя сломать.";
+            meta.setLore(List.of(line1, line2));
+            result.setItemMeta(meta);
+        }
+        NamespacedKey rkey = new NamespacedKey(this, "sea_heater");
+        ShapedRecipe recipe = new ShapedRecipe(rkey, result);
+        recipe.shape("ABA", "CDC", "EFE");
+        recipe.setIngredient('A', Material.PRISMARINE_SHARD);
+        recipe.setIngredient('B', Material.BUCKET);
+        recipe.setIngredient('C', Material.PRISMARINE_CRYSTALS);
+        recipe.setIngredient('D', Material.CONDUIT);
+        recipe.setIngredient('E', Material.TURTLE_SCUTE);
+        recipe.setIngredient('F', Material.MAGMA_BLOCK);
+        Bukkit.addRecipe(recipe);
+    }
+
+    private void registerMegaFurnaceRecipe() {
+        ItemStack result = new ItemStack(Material.MAGMA_BLOCK);
+        ItemMeta meta = result.getItemMeta();
+        if (meta != null) {
+            NamespacedKey key = new NamespacedKey(this, "heater_type");
+            meta.getPersistentDataContainer().set(key, PersistentDataType.STRING, "mega_furnace");
+            meta.setDisplayName(ChatColor.RED + "Мегапечь");
+            String line1 = "Распространяет " + ChatColor.RED + "адский жар" + ChatColor.RESET + " на огромную территорию,";
+            String line2 = "вмещает и требует " + ChatColor.GOLD + "много топлива" + ChatColor.RESET + ". Нельзя сломать.";
+            meta.setLore(List.of(line1, line2));
+            result.setItemMeta(meta);
+        }
+        NamespacedKey rkey = new NamespacedKey(this, "mega_furnace");
+        ShapedRecipe recipe = new ShapedRecipe(rkey, result);
+        recipe.shape("AMA", "DND", "BEB");
+        recipe.setIngredient('A', Material.MAGMA_CREAM);
+        recipe.setIngredient('M', Material.GOLD_INGOT);
+        recipe.setIngredient('D', Material.DIAMOND_BLOCK);
+        recipe.setIngredient('N', Material.NETHER_STAR);
+        recipe.setIngredient('B', Material.BLAZE_POWDER);
+        recipe.setIngredient('E', Material.LAVA_BUCKET);
+        Bukkit.addRecipe(recipe);
+    }
+
+    private void registerHeatedHatRecipe() {
+        ItemStack result = new ItemStack(Material.COPPER_HELMET);
+        ItemMeta meta = result.getItemMeta();
+        if (meta != null) {
+            meta.setDisplayName(ChatColor.GOLD + "Шапка с подогревом");
+            List<String> lore = new ArrayList<>();
+            lore.add("Шапка с подогревом позволяет в несколько раз дольше находиться на холоде!");
+            lore.add(ChatColor.GOLD + "Прочность: " + HEATED_HAT_MAX_DUR + "/" + HEATED_HAT_MAX_DUR);
+            meta.setLore(lore);
+            meta.getPersistentDataContainer().set(heatedHatKey, PersistentDataType.STRING, "true");
+            meta.getPersistentDataContainer().set(heatedHatDurKey, PersistentDataType.INTEGER, Integer.valueOf(HEATED_HAT_MAX_DUR));
+            meta.setUnbreakable(true);
+            result.setItemMeta(meta);
+        }
+
+        NamespacedKey key = new NamespacedKey(this, "heated_hat");
+        ShapedRecipe recipe = new ShapedRecipe(key, result);
+        recipe.shape(" A ", "ABA", " C ");
+        recipe.setIngredient('A', Material.RABBIT_HIDE);
+        recipe.setIngredient('B', Material.MAGMA_BLOCK);
+        recipe.setIngredient('C', Material.COPPER_HELMET);
         Bukkit.addRecipe(recipe);
     }
 
     @Override
     public void onDisable() {
-        // безопасные проверки: некоторые менеджеры могут быть null, если onEnable прервался
+        if (customHeatManager != null) {
+            try { customHeatManager.onDisable(); } catch (Throwable ignored) {}
+        }
         if (dataManager != null) dataManager.saveAll();
         if (stageManager != null) stageManager.onDisable();
         if (freezeManager != null) freezeManager.onDisable();
@@ -117,4 +199,6 @@ public class TheGreatColdPlugin extends JavaPlugin {
     public FreezeManager getFreezeManager() { return freezeManager; }
     public HeatSourceManager getHeatSourceManager() { return heatSourceManager; }
     public CustomHeatManager getCustomHeatManager() { return customHeatManager; }
+    public NamespacedKey getHeatedHatKey() { return heatedHatKey; }
+    public NamespacedKey getHeatedHatDurKey() { return heatedHatDurKey; }
 }

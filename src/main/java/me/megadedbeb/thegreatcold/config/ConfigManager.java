@@ -109,4 +109,22 @@ public class ConfigManager {
     public TheGreatColdPlugin getPlugin() {
         return plugin;
     }
+
+    /**
+     * Возвращает сообщение из секции messages.<key>. Поддерживает форматирование через String.format.
+     * Пример использования: getMessage("freeze.warmed", stageId)
+     */
+    public String getMessage(String key, Object... args) {
+        String path = "messages." + key;
+        String msg = plugin.getConfig().getString(path);
+        if (msg == null) return "";
+        if (args != null && args.length > 0) {
+            try {
+                return String.format(msg, args);
+            } catch (Exception ignored) {
+                return msg;
+            }
+        }
+        return msg;
+    }
 }

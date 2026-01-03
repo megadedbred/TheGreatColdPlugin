@@ -24,6 +24,7 @@ public class DataManager {
     private final Map<UUID, PlayerFreezeData> playerData = new HashMap<>();
 
     // сохранённые источники тепла (ключ world:x:y:z)
+    // NOTE: natural heat_sources are no longer persisted; this map kept for in-memory usage if needed
     private final Map<String, HeatSourceRegion> savedHeatSources = new HashMap<>();
 
     // сохранённые кастомные источники: key -> map(type, world, x, y, z, fuelMillis)
@@ -59,36 +60,31 @@ public class DataManager {
                     long withoutHeat = config.getLong("players." + s + ".timeWithoutHeat", 0L);
                     long dmgAcc = config.getLong("players." + s + ".damageAccumulatorMs", 0L);
                     boolean heat = config.getBoolean("players." + s + ".inHeat", false);
+
+                    // Новые поля для подземной механики
+                    long timeBelowY = config.getLong("players." + s + ".timeBelowY", 0L);
+                    long timeAboveY = config.getLong("players." + s + ".timeAboveY", 0L);
+                    boolean underground = config.getBoolean("players." + s + ".undergroundMode", false);
+
                     PlayerFreezeData data = new PlayerFreezeData(uuid);
                     data.setFreezeStage(me.megadedbeb.thegreatcold.freeze.FreezeStage.fromId(stage));
                     data.setTimeInHeat(inHeat);
                     data.setTimeWithoutHeat(withoutHeat);
                     data.setDamageAccumulatorMs(dmgAcc);
                     data.setInHeat(heat);
+
+                    // применяем загруженные подземные данные
+                    data.setTimeBelowY(timeBelowY);
+                    data.setTimeAboveY(timeAboveY);
+                    data.setUndergroundMode(underground);
+
                     playerData.put(uuid, data);
                 } catch (Exception ignored) {}
             }
         }
 
-        if (config.isConfigurationSection("heat_sources")) {
-            for (String key : config.getConfigurationSection("heat_sources").getKeys(false)) {
-                try {
-                    String world = config.getString("heat_sources." + key + ".world");
-                    int x = config.getInt("heat_sources." + key + ".x");
-                    int y = config.getInt("heat_sources." + key + ".y");
-                    int z = config.getInt("heat_sources." + key + ".z");
-                    String typeName = config.getString("heat_sources." + key + ".type");
-                    int radius = config.getInt("heat_sources." + key + ".radius", 1);
-                    if (world == null) continue;
-                    var w = Bukkit.getWorld(world);
-                    if (w == null) continue;
-                    Location loc = new Location(w, x, y, z);
-                    HeatSourceType t = HeatSourceType.valueOf(typeName);
-                    HeatSourceRegion region = new HeatSourceRegion(loc, t, radius);
-                    savedHeatSources.put(key, region);
-                } catch (Exception ignored) {}
-            }
-        }
+        // NOTE: we intentionally do NOT read "heat_sources" from config any more.
+        // Natural heat sources are discovered at runtime (dynamic), only custom_sources are persisted.
 
         if (config.isConfigurationSection("custom_sources")) {
             for (String key : config.getConfigurationSection("custom_sources").getKeys(false)) {
@@ -130,24 +126,16 @@ public class DataManager {
                 config.set("players." + k + ".timeWithoutHeat", d.getTimeWithoutHeat());
                 config.set("players." + k + ".damageAccumulatorMs", d.getDamageAccumulatorMs());
                 config.set("players." + k + ".inHeat", d.isInHeat());
+
+                // Сохраняем новые поля для подземной логики
+                config.set("players." + k + ".timeBelowY", d.getTimeBelowY());
+                config.set("players." + k + ".timeAboveY", d.getTimeAboveY());
+                config.set("players." + k + ".undergroundMode", d.isUndergroundMode());
             }
         }
 
-        if (savedHeatSources.isEmpty()) {
-            config.set("heat_sources", null);
-        } else {
-            for (Map.Entry<String, HeatSourceRegion> en : savedHeatSources.entrySet()) {
-                String key = en.getKey();
-                HeatSourceRegion r = en.getValue();
-                Location c = r.getCenter();
-                config.set("heat_sources." + key + ".world", c.getWorld().getName());
-                config.set("heat_sources." + key + ".x", c.getBlockX());
-                config.set("heat_sources." + key + ".y", c.getBlockY());
-                config.set("heat_sources." + key + ".z", c.getBlockZ());
-                config.set("heat_sources." + key + ".type", r.getType().name());
-                config.set("heat_sources." + key + ".radius", r.getRadius());
-            }
-        }
+        // Important: do NOT persist natural heat_sources. Keep only custom_sources persisted.
+        config.set("heat_sources", null);
 
         if (savedCustomSources.isEmpty()) {
             config.set("custom_sources", null);
@@ -188,7 +176,7 @@ public class DataManager {
     }
     public Map<UUID, PlayerFreezeData> getAllPlayerData() { return playerData; }
 
-    // heat sources persistence API
+    // heat sources persistence API (kept for compatibility but natural sources are intentionally not persisted)
     public Collection<HeatSourceRegion> getSavedHeatSources() {
         return Collections.unmodifiableCollection(savedHeatSources.values());
     }
